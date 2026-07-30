@@ -1,2 +1,11 @@
 __pycache__/
 *.pyc
+
+# NEVER commit a key: the key protects your files, publishing it would defeat
+# the whole point of the encryption.
+key/
+key.txt
+
+# Local outputs, specific to each machine.
+pack/
+unpack/
