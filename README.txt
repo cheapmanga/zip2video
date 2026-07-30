@@ -1,23 +1,16 @@
-zip2video - wrap a .zip inside a valid video file (MKV or MP4), and get it back
-=============================================================================
+zip2mkv - wrap a .zip inside a valid MKV video, and get it back
+==============================================================
 
 WHAT IT DOES
 ------------
-Takes a .zip file and stores it inside a valid video file. The video is
+Takes a .zip file and stores it inside a valid .mkv video. The video is
 recognized as real (it has a 1-second video track), and the .zip rides along
-untouched. Extracting gives you back the exact same .zip, byte for byte
-(no re-compression).
+untouched as a Matroska attachment - the official Matroska mechanism for
+embedding an arbitrary file. Extracting gives you back the exact same .zip,
+byte for byte (no re-compression).
 
-Two containers are supported:
-  .mkv   the .zip is a Matroska attachment (the official Matroska mechanism
-         for embedding an arbitrary file). Video track: one MJPEG frame.
-  .mp4   MP4 has no attachment concept, so the .zip goes into a top-level
-         'free' box - a box the MP4 spec explicitly defines as "to be
-         ignored", so every player skips over it. Video track: one H.264
-         frame.
-
-This is encapsulation, NOT encryption: anyone with this tool (or MKVToolNix,
-for the .mkv) can pull the .zip back out. Do not treat it as protection.
+This is encapsulation, NOT encryption: anyone with this tool, or with
+MKVToolNix, can pull the .zip back out. Do not treat it as protection.
 
 Despite the name, it is not limited to .zip files - any file works. Only the
 label stored alongside it says "zip".
@@ -25,13 +18,12 @@ label stored alongside it says "zip".
 
 FILES IN THIS FOLDER
 --------------------
-  zip2video.py   The actual program (pure Python, no dependencies).
-  pack.bat       Drag a .zip onto it -> creates the .mkv next to it.
-  pack-mp4.bat   Drag a .zip onto it -> creates the .mp4 next to it.
-  unpack.bat     Drag a .mkv or .mp4 onto it -> extracts the .zip next to it.
-  README.txt     This file.
+  zip2mkv.py   The actual program (pure Python, no dependencies).
+  pack.bat     Drag a .zip onto it -> creates the .mkv next to it.
+  unpack.bat   Drag a .mkv onto it -> extracts the .zip next to it.
+  README.txt   This file.
 
-Keep all files together in the same folder. The .bat files call zip2video.py
+Keep all files together in the same folder. The .bat files call zip2mkv.py
 that sits next to them.
 
 
@@ -44,12 +36,8 @@ During install from python.org, tick "Add Python to PATH".
 
 HOW TO USE (easy way: drag and drop)
 ------------------------------------
-  Pack to mkv:  drag your .zip file onto  pack.bat
-  Pack to mp4:  drag your .zip file onto  pack-mp4.bat
-  Unpack:       drag your .mkv or .mp4 onto  unpack.bat
-
-Unpacking detects the container on its own - you do not have to say which
-one it is.
+  Pack:    drag your .zip file onto  pack.bat
+  Unpack:  drag the .mkv onto  unpack.bat
 
 A black window opens, shows the result, and waits for a key press.
 
@@ -63,29 +51,34 @@ HOW TO USE (command line)
 Open Command Prompt (Windows key -> type cmd -> Enter), go to this folder
 (cd C:\path\to\this\folder), then:
 
-  python zip2video.py pack        my_archive.zip     (-> my_archive.mkv)
-  python zip2video.py pack --mp4  my_archive.zip     (-> my_archive.mp4)
-  python zip2video.py info        my_archive.mp4     (show what is inside)
-  python zip2video.py unpack      my_archive.mp4     (-> my_archive.zip)
+  python zip2mkv.py pack   my_archive.zip              (-> my_archive.mkv)
+  python zip2mkv.py attach video.mkv my_archive.zip    (ride along)
+  python zip2mkv.py info   my_archive.mkv              (show what is inside)
+  python zip2mkv.py unpack my_archive.mkv              (-> my_archive.zip)
 
-You can add a second name to choose the output file. The extension you give
-picks the container:
-  python zip2video.py pack  my_archive.zip  hidden.mp4     (-> MP4)
-  python zip2video.py pack  my_archive.zip  hidden.mkv     (-> MKV)
+You can add a last name to choose the output file:
+  python zip2mkv.py pack my_archive.zip hidden.mkv
+
+'attach' puts the zip into a video you already have, instead of building a
+1-second one. The video keeps playing exactly as before - verified, its picture
+and sound decode bit-identically. Only this script finds an attachment added
+that way; use 'pack' if mkvextract must see it too.
 
 
 NOTES
 -----
 - Playing the video shows a still image for about 1 second. That is normal:
   the video is only there so the container counts as a real video. The zip is
-  not "played" - it is a passenger you pull back out with unpack.
+  not "played" - it is a passenger you pull back out with unpack. Use attach
+  instead if you would rather carry it inside a real video of your own.
 - IMPORTANT - re-encoding destroys the payload. If you send the file through
   anything that re-encodes or remuxes it (a video host, a messaging app that
-  compresses videos, an editor), the attachment or the 'free' box is dropped
-  and the zip is gone. Only the untouched original file can be unpacked.
-- MKV or MP4? MP4 is accepted in more places and looks more ordinary. MKV
-  uses a documented attachment mechanism, so MKVToolNix and mkvextract can
-  pull the file out even without this script. Both round-trip identically.
-- Verified: for both containers, the extracted zip is identical to the
-  original (same SHA-256), and the video decodes correctly (ffprobe reports a
-  valid 320x240 stream, and the frame decodes to a real image).
+  compresses videos, an editor), the attachment is dropped and the zip is gone.
+  Only the untouched original file can be unpacked. A transcoded carrier is
+  easy to spot: it collapses to a couple of kilobytes.
+- MKVToolNix and mkvextract can pull the file out even without this script
+  (verified with ffmpeg -dump_attachment). That only works because pack writes
+  the attachment before the first Cluster; placed after it, no standard tool
+  would ever reach it.
+- Verified: the extracted zip is identical to the original (same SHA-256),
+  and after attach the video and audio decode bit-identically to the source.

@@ -21,6 +21,9 @@ Usage
   # Emballer un zip dans un mkv :
   python3 zip2mkv.py pack  mon_archive.zip  [sortie.mkv]
 
+  # Ou l'accrocher a une video que l'on a deja, qui reste lisible normalement :
+  python3 zip2mkv.py attach ma_video.mkv  mon_archive.zip  [sortie.mkv]
+
   # Re-extraire le zip depuis le mkv :
   python3 zip2mkv.py unpack sortie.mkv      [mon_archive.zip]
 
@@ -203,8 +206,14 @@ def pack(zip_path, mkv_path):
     segment_body = (
         _build_info() +
         _build_tracks() +
-        _build_cluster() +
-        _build_attachments(zip_bytes, os.path.basename(zip_path))
+        # Attachments DOIT preceder le premier Cluster : les lecteurs arretent
+        # de parcourir les elements d'en-tete des qu'ils rencontrent un Cluster.
+        # Place apres, l'element est invisible pour ffmpeg et mkvextract (ce
+        # script le trouverait quand meme, car il parcourt tout le fichier,
+        # mais aucun autre outil ne le verrait). Verifie avec
+        # `ffmpeg -dump_attachment`.
+        _build_attachments(zip_bytes, os.path.basename(zip_path)) +
+        _build_cluster()
     )
     data = _build_ebml_header() + elem(SEGMENT, segment_body)
 
@@ -220,6 +229,98 @@ def pack(zip_path, mkv_path):
 # ---------------------------------------------------------------------------
 # Lecture EBML (extraction)
 # ---------------------------------------------------------------------------
+def attach(video_path, zip_path, out_path):
+    """Ajoute une piece jointe a une video MKV existante, sans la modifier.
+
+    L'element Attachments est ajoute a la fin des donnees du Segment, et seule
+    la taille du Segment est reecrite. Les positions stockees dans Cues et
+    SeekHead sont relatives au debut des donnees du Segment : elles restent
+    donc valides meme si ce champ de taille gagne un octet. Rien de ce qui
+    existait deja dans le fichier ne bouge.
+
+    Contrepartie : la piece jointe se retrouve apres le premier Cluster, donc
+    seuls ce script la verra (voir le commentaire dans pack)."""
+    with open(zip_path, 'rb') as f:
+        zip_bytes = f.read()
+    name = os.path.basename(zip_path)
+    attachments = _build_attachments(zip_bytes, name)
+
+    with open(video_path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        filesize = f.tell()
+        f.seek(0)
+
+        if _read_id(f) != EBML:
+            raise SystemExit(
+                "[ERREUR] {} n'est pas un fichier Matroska.".format(video_path))
+        # En deux temps : _read_size avance le curseur, donc f.tell() doit etre
+        # lu APRES, sinon header_end est decale de la longueur du champ taille.
+        ebml_size = _read_size(f)
+        header_end = f.tell() + ebml_size
+
+        f.seek(header_end)
+        if _read_id(f) != SEGMENT:
+            raise SystemExit(
+                "[ERREUR] {} : Segment attendu apres l'en-tete EBML.\n"
+                "         Ce fichier est trop inhabituel pour etre modifie ici."
+                .format(video_path))
+        size_pos = f.tell()
+        seg_size = _read_size(f)            # None = taille inconnue
+        seg_data_start = f.tell()
+        old_vint_len = seg_data_start - size_pos
+
+    def _copy(src, dst, length=None):
+        """Recopie sans charger le fichier en memoire."""
+        remaining = length
+        while True:
+            want = 1 << 20 if remaining is None else min(1 << 20, remaining)
+            if want <= 0:
+                return
+            chunk = src.read(want)
+            if not chunk:
+                return
+            dst.write(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
+
+    if seg_size is None:
+        # Segment de taille inconnue : il va jusqu'a la fin du fichier, il
+        # suffit donc d'ajouter les pieces jointes a la suite.
+        with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
+            _copy(src, dst)
+            dst.write(attachments)
+    else:
+        seg_end = seg_data_start + seg_size
+        if seg_end != filesize:
+            raise SystemExit(
+                "[ERREUR] {} : le Segment ne va pas jusqu'a la fin du fichier\n"
+                "         ({} octets le suivent). Ajouter une piece jointe les\n"
+                "         corromprait.".format(video_path, filesize - seg_end))
+
+        new_vint = encode_size(seg_size + len(attachments))
+        # On garde la meme largeur de champ quand c'est possible, pour que
+        # rien ne se decale du tout.
+        if len(new_vint) < old_vint_len:
+            marker = 1 << (7 * old_vint_len)
+            new_vint = ((seg_size + len(attachments)) | marker).to_bytes(
+                old_vint_len, 'big')
+
+        with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
+            _copy(src, dst, size_pos)       # en-tete EBML + identifiant Segment
+            dst.write(new_vint)
+            src.seek(seg_data_start)
+            _copy(src, dst, seg_size)       # contenu original du Segment
+            dst.write(attachments)
+
+    before = os.path.getsize(video_path)
+    after = os.path.getsize(out_path)
+    print("[OK] MKV cree : {}".format(out_path))
+    print("     video porteuse : {} ({} octets, inchangee)".format(
+        os.path.basename(video_path), before))
+    print("     zip embarque : {} ({} octets)".format(name, len(zip_bytes)))
+    print("     taille finale : {} octets  (+{})".format(after, after - before))
+
+
 def _read_id(f):
     """Lit un identifiant d'element EBML (octets bruts). Retourne None a la fin."""
     first = f.read(1)
@@ -374,6 +475,18 @@ def main(argv):
         zip_path = argv[2]
         mkv_path = argv[3] if len(argv) > 3 else os.path.splitext(zip_path)[0] + '.mkv'
         pack(zip_path, mkv_path)
+
+    elif cmd == 'attach':
+        if len(argv) < 4:
+            _usage(); return 1
+        video_path, zip_path = argv[2], argv[3]
+        if len(argv) > 4:
+            out_path = argv[4]
+        else:
+            base, ext = os.path.splitext(video_path)
+            out_path = base + '_avec_' + \
+                os.path.splitext(os.path.basename(zip_path))[0] + ext
+        attach(video_path, zip_path, out_path)
 
     elif cmd == 'unpack':
         if len(argv) < 3:
