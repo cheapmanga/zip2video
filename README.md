@@ -13,23 +13,67 @@ no MKVToolNix.
 > This is encapsulation, **not encryption**. Anyone with this script — or with
 > MKVToolNix — can pull the file straight back out. Do not treat it as protection.
 
+## Encryption and layout
+
+The payload is **encrypted** with a key you keep in `key/key.txt`, and the output is
+written into a `pack/` (or `unpack/`) folder next to the script, created if missing:
+
+```
+your-folder/
+    zip2mkv.py
+    key/
+        key.txt        <- your key, one line. NEVER commit this.
+    video.mkv          <- an existing video, if you want to use `attach`
+    pack/              <- pack/attach write here
+    unpack/            <- unpack writes here
+```
+
+Where the key comes from depends on the command:
+
+- **`pack` / `attach`** — use `key/key.txt` if it exists, otherwise **prompt** for the
+  key at the keyboard (typed hidden, like a password).
+- **`unpack`** — never looks at `key/key.txt`; it **always** prompts for the key. So
+  the key that decrypts is never stored on the machine doing the extraction.
+
+Put any key you like on the single first non-comment line of `key/key.txt`. **The key
+never goes into the repository** (`key/` is in `.gitignore`); publishing it would
+defeat the whole point.
+
+The scheme, all from the Python standard library, no dependency:
+
+- key derivation: **PBKDF2-HMAC-SHA256**, 200 000 iterations, per-file random salt —
+  this is what makes brute-forcing a key slow;
+- stream: **SHAKE256 in counter mode**, XORed with the data;
+- integrity: **HMAC-SHA256, encrypt-then-MAC**. A wrong key or a tampered file is
+  rejected with a clear error, and nothing is written — you are never handed silent
+  garbage, and you can tell "wrong key" from "corrupted file".
+
+> Still encapsulation, not a safe. The strength is entirely your key: a weak key is
+> weakly protected, however good the cipher.
+
 ## Usage
 
 ```bash
-python3 zip2mkv.py pack        archive.zip            # -> archive.mkv
-python3 zip2mkv.py pack --mp4  archive.zip            # -> archive.mp4
+python3 zip2mkv.py pack        archive.zip            # -> pack/archive.mkv
+python3 zip2mkv.py pack --mp4  archive.zip            # -> pack/archive.mp4
 python3 zip2mkv.py pack        archive.zip clip.mp4   # extension picks the container
 python3 zip2mkv.py attach      holiday.mkv archive.zip  # ride along with a real video
-python3 zip2mkv.py info        clip.mp4               # list what is attached
-python3 zip2mkv.py unpack      clip.mp4               # -> archive.zip
+python3 zip2mkv.py info        pack/clip.mp4          # list what is attached
+python3 zip2mkv.py unpack      pack/clip.mp4          # -> unpack/archive.zip
+python3 zip2mkv.py selftest                           # verify crypto + containers
 ```
 
 `unpack`, `info` and `attach` detect the container on their own — you never have to
 say which one it is.
 
-On Windows, `unpack.bat` is a drag-and-drop wrapper: drop a `.mkv` or `.mp4` on it and
-the file comes back out. Packing is command line only. See `README.txt` for the
-end-user instructions shipped alongside it.
+`selftest` runs entirely in memory: it does not read `key/key.txt` and writes nothing
+into `pack/` or `unpack/`, so you can check a fresh clone before trusting it with real
+data.
+
+On Windows, `unpack.bat` is a drag-and-drop wrapper: drop a `.mkv` or `.mp4` on it, it
+**asks for the decryption key** (typed hidden), and the file comes back out into
+`unpack/`. Packing is command line only. See `README.txt` for the end-user
+instructions shipped alongside it.
 
 Despite the name, it is not limited to `.zip` — any file works. Only the MIME label
 stored next to it says "zip".
