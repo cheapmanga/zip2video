@@ -5,11 +5,11 @@ REM
 REM  Usage: drag a .mkv or .mp4 file onto this .bat icon.
 REM  The container is detected automatically.
 REM  The .zip is recreated next to the video.
-REM  (Must stay in the same folder as zip2video.py)
+REM  (Must stay in the same folder as zip2mkv.py)
 REM ============================================================
 setlocal
 
-REM Move into the folder of this .bat (where zip2video.py lives)
+REM Move into the folder of this .bat (where zip2mkv.py lives)
 cd /d "%~dp0"
 
 REM Check that Python is available
@@ -40,7 +40,7 @@ if "%MKV%"=="" (
 )
 
 echo.
-python "%~dp0zip2video.py" unpack "%MKV%"
+python "%~dp0zip2mkv.py" unpack "%MKV%"
 echo.
 pause
 endlocal

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zip2video.py - Wrap a .zip file inside a valid video container (MKV or MP4),
+zip2mkv.py - Wrap a .zip file inside a valid video container (MKV or MP4),
 and extract it back bit-for-bit.
 
 No external dependencies: both containers are built by hand. No ffmpeg, no
@@ -25,16 +25,19 @@ The storage mechanism differs per container:
 
 Usage
 -----
+  # Attach a zip to a video you already have, which keeps playing normally:
+  python zip2mkv.py attach holiday.mkv  my_archive.zip
+
   # Wrap a zip into a video (the output extension picks the container):
-  python zip2video.py pack   my_archive.zip                (-> my_archive.mkv)
-  python zip2video.py pack   my_archive.zip  hidden.mp4    (-> MP4)
-  python zip2video.py pack --mp4  my_archive.zip           (-> my_archive.mp4)
+  python zip2mkv.py pack   my_archive.zip                (-> my_archive.mkv)
+  python zip2mkv.py pack   my_archive.zip  hidden.mp4    (-> MP4)
+  python zip2mkv.py pack --mp4  my_archive.zip           (-> my_archive.mp4)
 
   # Extract the zip back (container is auto-detected):
-  python zip2video.py unpack hidden.mp4      [my_archive.zip]
+  python zip2mkv.py unpack hidden.mp4      [my_archive.zip]
 
   # Show what is embedded (container is auto-detected):
-  python zip2video.py info   hidden.mp4
+  python zip2mkv.py info   hidden.mp4
 
 If the output name is omitted, it is derived from the input name.
 """
@@ -168,8 +171,8 @@ def _build_info():
     return elem(INFO,
         elem(TIMESTAMP_SCALE, (1_000_000).to_bytes(3, 'big')) +   # 1 ms
         elem(DURATION,        struct.pack('>d', 1000.0)) +        # ~1 s
-        elem(MUXING_APP,      b'zip2video') +
-        elem(WRITING_APP,     b'zip2video'))
+        elem(MUXING_APP,      b'zip2mkv') +
+        elem(WRITING_APP,     b'zip2mkv'))
 
 
 def _build_tracks():
@@ -194,11 +197,11 @@ def _build_cluster():
         elem(SIMPLE_BLOCK, block))
 
 
-def _build_attachments(zip_bytes, filename):
+def _build_attachments(zip_bytes, filename, mime='application/zip'):
     attached = elem(ATTACHED_FILE,
         elem(FILE_DESCRIPTION, "Embedded zip archive".encode('utf-8')) +
         elem(FILE_NAME,        filename.encode('utf-8')) +
-        elem(FILE_MIME_TYPE,   b'application/zip') +
+        elem(FILE_MIME_TYPE,   mime.encode('utf-8')) +
         elem(FILE_DATA,        zip_bytes) +
         elem(FILE_UID,         b'\x00\x00\x00\x00\x00\x00\x00\x02'))
     return elem(ATTACHMENTS, attached)
@@ -209,8 +212,12 @@ def _pack_mkv(payload, name):
     segment_body = (
         _build_info() +
         _build_tracks() +
-        _build_cluster() +
-        _build_attachments(payload, name)
+        # Attachments MUST come before the first Cluster: parsers stop reading
+        # header-level elements once they hit a Cluster, so an attachment placed
+        # after it is invisible to ffmpeg and mkvextract (this script would
+        # still find it, since it walks the whole file - but nothing else would).
+        _build_attachments(payload, name) +
+        _build_cluster()
     )
     return _build_ebml_header() + elem(SEGMENT, segment_body)
 
@@ -469,6 +476,166 @@ def _pack_mp4(payload, name, mime='application/zip'):
     return ftyp + free + mdat + _build_mp4_moov(chunk_offset)
 
 
+# ---------------------------------------------------------------------------
+# Attaching to an existing video, instead of building a carrier
+# ---------------------------------------------------------------------------
+# The container tools above build a throwaway 1-second video. When you already
+# have a real video, it is better to ride along with it: the result plays
+# normally and looks like exactly what it is, a video.
+#
+# Both injections are written so that nothing already in the file moves:
+#   MP4  the 'free' box is APPENDED at the very end. Chunk offsets in stco/co64
+#        are absolute file positions, so appending is the one edit that cannot
+#        invalidate them.
+#   MKV  the Attachments element is appended at the end of the Segment's data,
+#        and only the Segment's size field is rewritten. Cue and SeekHead
+#        positions are stored relative to the start of the Segment data, so
+#        they stay correct even if that size field grows a byte.
+_COPY_CHUNK = 1 << 20
+
+
+def _copy_stream(src, dst, length=None):
+    """Copy bytes without loading the file into memory."""
+    remaining = length
+    while True:
+        want = _COPY_CHUNK if remaining is None else min(_COPY_CHUNK, remaining)
+        if want <= 0:
+            return
+        chunk = src.read(want)
+        if not chunk:
+            return
+        dst.write(chunk)
+        if remaining is not None:
+            remaining -= len(chunk)
+
+
+def _mp4_last_box_needs_size_fix(path):
+    """An MP4 box may declare size 0, meaning 'to the end of the file'.
+
+    Appending after such a box would silently swallow the new data into it, so
+    the size has to be written out first. Returns (offset, real_size) or None."""
+    with open(path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        filesize = f.tell()
+        offset = 0
+        last = None
+        while offset < filesize - 7:
+            f.seek(offset)
+            head = f.read(8)
+            if len(head) < 8:
+                break
+            size = struct.unpack('>I', head[0:4])[0]
+            body = offset + 8
+            if size == 1:
+                size = struct.unpack('>Q', f.read(8))[0]
+                body = offset + 16
+            elif size == 0:
+                last = (offset, filesize - offset)
+                break
+            if size < 8:
+                break
+            offset += size
+        return last
+
+
+def _attach_to_mp4(video_path, out_path, payload, name, mime):
+    """Copy an MP4 and append the payload as a top-level 'free' box."""
+    fix = _mp4_last_box_needs_size_fix(video_path)
+    box = _build_mp4_payload_box(payload, name, mime)
+    with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
+        _copy_stream(src, dst)
+        dst.write(box)
+    if fix is not None:
+        offset, real_size = fix
+        if real_size > 0xFFFFFFFF:
+            raise SystemExit(
+                "[ERROR] {} ends with an open-ended box larger than 4 GB;\n"
+                "        rewriting it would need a 64-bit size. Remux it first."
+                .format(video_path))
+        with open(out_path, 'r+b') as dst:
+            dst.seek(offset)
+            dst.write(struct.pack('>I', real_size))
+
+
+def _attach_to_mkv(video_path, out_path, payload, name, mime):
+    """Copy an MKV, appending an Attachments element inside the Segment."""
+    attachments = _build_attachments(payload, name, mime)
+
+    with open(video_path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        filesize = f.tell()
+        f.seek(0)
+
+        # EBML header, copied through untouched.
+        if _read_id(f) != EBML:
+            raise SystemExit("[ERROR] {} is not a Matroska file.".format(video_path))
+        ebml_size = _read_size(f)
+        header_end = f.tell() + ebml_size
+
+        f.seek(header_end)
+        if _read_id(f) != SEGMENT:
+            raise SystemExit(
+                "[ERROR] {}: expected a Segment after the EBML header.\n"
+                "        This file is too unusual for in-place attaching."
+                .format(video_path))
+        size_pos = f.tell()
+        seg_size = _read_size(f)          # None means 'unknown size'
+        seg_data_start = f.tell()
+        old_vint_len = seg_data_start - size_pos
+
+    if seg_size is None:
+        # Unknown-size Segment runs to the end of the file, so appending the
+        # attachments is all that is needed.
+        with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
+            _copy_stream(src, dst)
+            dst.write(attachments)
+        return
+
+    seg_end = seg_data_start + seg_size
+    if seg_end != filesize:
+        raise SystemExit(
+            "[ERROR] {}: the Segment does not run to the end of the file\n"
+            "        ({} bytes follow it). Attaching would corrupt them."
+            .format(video_path, filesize - seg_end))
+
+    new_size = seg_size + len(attachments)
+    new_vint = encode_size(new_size)
+    # Keep the size field the same width when we can, so nothing shifts at all.
+    if len(new_vint) < old_vint_len:
+        marker = 1 << (7 * old_vint_len)
+        if new_size >= marker - 1:
+            raise SystemExit("[ERROR] cannot re-encode the Segment size")
+        new_vint = (new_size | marker).to_bytes(old_vint_len, 'big')
+
+    with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
+        _copy_stream(src, dst, size_pos)      # EBML header + Segment id
+        dst.write(new_vint)
+        src.seek(seg_data_start)
+        _copy_stream(src, dst, seg_size)      # the original Segment content
+        dst.write(attachments)
+
+
+def attach(video_path, src_path, out_path):
+    """Attach a file to an existing video, keeping the video playable."""
+    kind = detect_container(video_path)
+    with open(src_path, 'rb') as f:
+        payload = f.read()
+    name = os.path.basename(src_path)
+
+    if kind == 'mkv':
+        _attach_to_mkv(video_path, out_path, payload, name, 'application/zip')
+    else:
+        _attach_to_mp4(video_path, out_path, payload, name, 'application/zip')
+
+    before = os.path.getsize(video_path)
+    after = os.path.getsize(out_path)
+    print("[OK] {} written: {}".format(kind.upper(), out_path))
+    print("     carrier video: {} ({} bytes, unchanged)".format(
+        os.path.basename(video_path), before))
+    print("     attached file: {} ({} bytes)".format(name, len(payload)))
+    print("     final size:    {} bytes  (+{})".format(after, after - before))
+
+
 def _mp4_attachments(path):
     """Walk the top-level MP4 boxes and return the embedded payloads.
 
@@ -629,6 +796,18 @@ def main(argv):
         out_path = rest[1] if len(rest) > 1 else \
             os.path.splitext(src_path)[0] + default_ext
         pack(src_path, out_path)
+
+    elif cmd == 'attach':
+        if len(argv) < 4:
+            _usage(); return 1
+        video_path, src_path = argv[2], argv[3]
+        if len(argv) > 4:
+            out_path = argv[4]
+        else:
+            base, ext = os.path.splitext(video_path)
+            out_path = base + '_with_' + \
+                os.path.splitext(os.path.basename(src_path))[0] + ext
+        attach(video_path, src_path, out_path)
 
     elif cmd == 'unpack':
         if len(argv) < 3:

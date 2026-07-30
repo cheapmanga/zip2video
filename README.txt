@@ -1,4 +1,4 @@
-zip2video - wrap a .zip inside a valid video file (MKV or MP4), and get it back
+zip2mkv - wrap a .zip inside a valid video file (MKV or MP4), and get it back
 =============================================================================
 
 WHAT IT DOES
@@ -25,13 +25,13 @@ label stored alongside it says "zip".
 
 FILES IN THIS FOLDER
 --------------------
-  zip2video.py   The actual program (pure Python, no dependencies).
+  zip2mkv.py   The actual program (pure Python, no dependencies).
   pack.bat       Drag a .zip onto it -> creates the .mkv next to it.
   pack-mp4.bat   Drag a .zip onto it -> creates the .mp4 next to it.
   unpack.bat     Drag a .mkv or .mp4 onto it -> extracts the .zip next to it.
   README.txt     This file.
 
-Keep all files together in the same folder. The .bat files call zip2video.py
+Keep all files together in the same folder. The .bat files call zip2mkv.py
 that sits next to them.
 
 
@@ -40,6 +40,18 @@ REQUIREMENTS
 Python 3 must be installed and on PATH.
 Get it from the Microsoft Store ("Python 3") or from python.org.
 During install from python.org, tick "Add Python to PATH".
+
+
+ATTACHING TO A VIDEO YOU ALREADY HAVE
+-------------------------------------
+pack.bat builds a throwaway 1-second carrier. If you would rather ride along
+with a real video, so the result plays normally:
+
+  python zip2mkv.py attach holiday.mkv my_archive.zip
+
+The video and its audio come out bit-identical to the original - nothing that
+was already in the file moves. Only this script can find an attachment added
+this way; if you need mkvextract to see it too, use pack instead.
 
 
 HOW TO USE (easy way: drag and drop)
@@ -63,15 +75,16 @@ HOW TO USE (command line)
 Open Command Prompt (Windows key -> type cmd -> Enter), go to this folder
 (cd C:\path\to\this\folder), then:
 
-  python zip2video.py pack        my_archive.zip     (-> my_archive.mkv)
-  python zip2video.py pack --mp4  my_archive.zip     (-> my_archive.mp4)
-  python zip2video.py info        my_archive.mp4     (show what is inside)
-  python zip2video.py unpack      my_archive.mp4     (-> my_archive.zip)
+  python zip2mkv.py attach      video.mkv my_archive.zip   (ride along)
+  python zip2mkv.py pack        my_archive.zip     (-> my_archive.mkv)
+  python zip2mkv.py pack --mp4  my_archive.zip     (-> my_archive.mp4)
+  python zip2mkv.py info        my_archive.mp4     (show what is inside)
+  python zip2mkv.py unpack      my_archive.mp4     (-> my_archive.zip)
 
 You can add a second name to choose the output file. The extension you give
 picks the container:
-  python zip2video.py pack  my_archive.zip  hidden.mp4     (-> MP4)
-  python zip2video.py pack  my_archive.zip  hidden.mkv     (-> MKV)
+  python zip2mkv.py pack  my_archive.zip  hidden.mp4     (-> MP4)
+  python zip2mkv.py pack  my_archive.zip  hidden.mkv     (-> MKV)
 
 
 NOTES
@@ -84,7 +97,7 @@ NOTES
   compresses videos, an editor), the attachment or the 'free' box is dropped
   and the zip is gone. Only the untouched original file can be unpacked.
 - MKV or MP4? MP4 is accepted in more places and looks more ordinary. MKV
-  uses a documented attachment mechanism, so MKVToolNix and mkvextract can
+  uses a documented attachment mechanism, so MKVToolNix and mkvextract can (verified)
   pull the file out even without this script. Both round-trip identically.
 - Verified: for both containers, the extracted zip is identical to the
   original (same SHA-256), and the video decodes correctly (ffprobe reports a

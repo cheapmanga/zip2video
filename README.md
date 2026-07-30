@@ -1,4 +1,4 @@
-# zip2video
+# zip2mkv
 
 Wrap any file inside a **valid video file** (MKV or MP4), and get it back byte for byte.
 
@@ -15,12 +15,41 @@ no MKVToolNix.
 ## Usage
 
 ```bash
-python zip2video.py pack        archive.zip            # -> archive.mkv
-python zip2video.py pack --mp4  archive.zip            # -> archive.mp4
-python zip2video.py pack        archive.zip  clip.mp4  # extension picks the container
-python zip2video.py info        clip.mp4               # show what is embedded
-python zip2video.py unpack      clip.mp4               # -> archive.zip
+python zip2mkv.py attach      holiday.mkv archive.zip  # ride along with a real video
+python zip2mkv.py pack        archive.zip              # -> archive.mkv
+python zip2mkv.py pack --mp4  archive.zip              # -> archive.mp4
+python zip2mkv.py pack        archive.zip  clip.mp4    # extension picks the container
+python zip2mkv.py info        clip.mp4                 # show what is embedded
+python zip2mkv.py unpack      clip.mp4                 # -> archive.zip
 ```
+
+## Attaching to a video you already have
+
+`pack` builds a throwaway one-second carrier. `attach` takes a video you already
+have and rides along with it, so the result is an ordinary video that plays normally:
+
+```bash
+python zip2mkv.py attach holiday.mkv archive.zip   # -> holiday_with_archive.mkv
+```
+
+Nothing already in the file moves, which is what keeps the video intact:
+
+- **MP4** — the `free` box is *appended at the very end*. `stco`/`co64` store absolute
+  file offsets, so appending is the one edit that cannot invalidate them.
+- **MKV** — the `Attachments` element is appended at the end of the Segment's data and
+  only the Segment size field is rewritten. Cue and SeekHead positions are stored
+  relative to the start of the Segment data, so they stay correct even if that size
+  field grows a byte.
+
+Verified: after attaching, the decoded video and audio streams are **bit-identical**
+to the original (same SHA-256 on the raw decoded output), and the payload comes back
+byte-exact.
+
+One limitation, measured rather than assumed: because the attachment lands *after* the
+first Cluster, `ffmpeg` and `mkvextract` will not see it — parsers stop reading
+header-level elements once they hit a Cluster. This script still finds it, since it
+walks the whole file. If you need the attachment visible to standard tools, use `pack`
+instead, which places it before the Cluster.
 
 `unpack` and `info` detect the container on their own — you never have to say which
 one it is.
@@ -41,7 +70,9 @@ stored next to it says "zip".
 | Video track | one MJPEG frame | one H.264 keyframe (Constrained Baseline) |
 
 **MKV** uses the documented Matroska attachment element, so `mkvextract` can recover
-the file even without this script.
+the file even without this script — verified by having `ffmpeg -dump_attachment` pull
+it out byte-exact. This only holds because `pack` writes the `Attachments` element
+*before* the first Cluster; placed after it, parsers never reach it.
 
 **MP4** has no attachment concept, so the payload goes into a top-level `free` box.
 The spec states its contents may be ignored, so every conformant parser walks past it.

@@ -4,11 +4,11 @@ REM  pack.bat  -  Wrap a .zip file into a .mkv
 REM
 REM  Usage: drag a .zip file onto this .bat icon.
 REM  The .mkv is created next to the .zip, with the same name.
-REM  (Must stay in the same folder as zip2video.py)
+REM  (Must stay in the same folder as zip2mkv.py)
 REM ============================================================
 setlocal
 
-REM Move into the folder of this .bat (where zip2video.py lives)
+REM Move into the folder of this .bat (where zip2mkv.py lives)
 cd /d "%~dp0"
 
 REM Check that Python is available
@@ -39,7 +39,7 @@ if "%ZIP%"=="" (
 )
 
 echo.
-python "%~dp0zip2video.py" pack "%ZIP%"
+python "%~dp0zip2mkv.py" pack "%ZIP%"
 echo.
 pause
 endlocal
