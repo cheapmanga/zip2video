@@ -1,13 +1,19 @@
-zip2mkv - wrap a .zip inside a valid MKV video, and get it back
-==============================================================
+zip2mkv - wrap a .zip inside a valid video file (MKV or MP4), and get it back
+============================================================================
 
 WHAT IT DOES
 ------------
-Takes a .zip file and stores it inside a valid .mkv video. The video is
+Takes a .zip file and stores it inside a valid video file. The video is
 recognized as real (it has a 1-second video track), and the .zip rides along
-untouched as a Matroska attachment - the official Matroska mechanism for
-embedding an arbitrary file. Extracting gives you back the exact same .zip,
-byte for byte (no re-compression).
+untouched. Extracting gives you back the exact same .zip, byte for byte
+(no re-compression).
+
+Two containers are supported:
+  .mkv   the .zip is a Matroska attachment - the official Matroska mechanism
+         for embedding an arbitrary file. Video track: one MJPEG frame.
+  .mp4   MP4 has no attachment concept, so the .zip goes into a top-level
+         'free' box, which the MP4 spec defines as meaningless and skippable,
+         so every player walks past it. Video track: one H.264 frame.
 
 This is encapsulation, NOT encryption: anyone with this tool, or with
 MKVToolNix, can pull the .zip back out. Do not treat it as protection.
@@ -19,7 +25,7 @@ label stored alongside it says "zip".
 FILES IN THIS FOLDER
 --------------------
   zip2mkv.py   The actual program (pure Python, no dependencies).
-  unpack.bat   Drag a .mkv onto it -> extracts the .zip next to it.
+  unpack.bat   Drag a .mkv or .mp4 onto it -> extracts the .zip next to it.
   README.txt   This file.
 
 Keep all files together in the same folder. The .bat files call zip2mkv.py
@@ -35,7 +41,9 @@ During install from python.org, tick "Add Python to PATH".
 
 HOW TO USE (easy way: drag and drop)
 ------------------------------------
-  Unpack:  drag the .mkv onto  unpack.bat
+  Unpack:  drag the .mkv or .mp4 onto  unpack.bat
+
+Unpacking detects the container on its own.
 
 A black window opens, shows the result, and waits for a key press.
 
@@ -51,13 +59,16 @@ HOW TO USE (command line)
 Open Command Prompt (Windows key -> type cmd -> Enter), go to this folder
 (cd C:\path\to\this\folder), then:
 
-  python zip2mkv.py pack   my_archive.zip              (-> my_archive.mkv)
-  python zip2mkv.py attach video.mkv my_archive.zip    (ride along)
-  python zip2mkv.py info   my_archive.mkv              (show what is inside)
-  python zip2mkv.py unpack my_archive.mkv              (-> my_archive.zip)
+  python zip2mkv.py pack        my_archive.zip         (-> my_archive.mkv)
+  python zip2mkv.py pack --mp4  my_archive.zip         (-> my_archive.mp4)
+  python zip2mkv.py attach      video.mkv my_archive.zip   (ride along)
+  python zip2mkv.py info        my_archive.mp4         (show what is inside)
+  python zip2mkv.py unpack      my_archive.mp4         (-> my_archive.zip)
 
-You can add a last name to choose the output file:
-  python zip2mkv.py pack my_archive.zip hidden.mkv
+You can add a last name to choose the output file. The extension you give picks
+the container:
+  python zip2mkv.py pack my_archive.zip hidden.mp4     (-> MP4)
+  python zip2mkv.py pack my_archive.zip hidden.mkv     (-> MKV)
 
 'attach' puts the zip into a video you already have, instead of building a
 1-second one. The video keeps playing exactly as before - verified, its picture
@@ -73,7 +84,8 @@ NOTES
   instead if you would rather carry it inside a real video of your own.
 - IMPORTANT - re-encoding destroys the payload. If you send the file through
   anything that re-encodes or remuxes it (a video host, a messaging app that
-  compresses videos, an editor), the attachment is dropped and the zip is gone.
+  compresses videos, an editor), the attachment or the 'free' box is dropped
+  and the zip is gone.
   Only the untouched original file can be unpacked. A transcoded carrier is
   easy to spot: it collapses to a couple of kilobytes.
 - MKVToolNix and mkvextract can pull the file out even without this script

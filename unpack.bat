@@ -1,8 +1,8 @@
 @echo off
 REM ============================================================
-REM  unpack.bat  -  Extract the .zip contained in a .mkv
+REM  unpack.bat  -  Extract the .zip contained in a .mkv or a .mp4
 REM
-REM  Usage: drag a .mkv file onto this .bat icon.
+REM  Usage: drag a .mkv or .mp4 file onto this .bat icon.
 
 REM  The .zip is recreated next to the video.
 REM  (Must stay in the same folder as zip2mkv.py)
@@ -25,9 +25,9 @@ if errorlevel 1 (
 
 REM Was a file dropped onto the icon?
 if "%~1"=="" (
-    echo drag a .mkv file onto this icon to unpack it.
+    echo Drag a .mkv or .mp4 file onto this icon to unpack it.
     echo.
-    set /p "MKV=Or type the path to the .mkv here: "
+    set /p "MKV=Or type the path to the video here: "
 ) else (
     set "MKV=%~1"
 )

@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zip2mkv.py — Encapsule un fichier .zip dans un conteneur video MKV (Matroska) valide,
+zip2mkv.py — Encapsule un fichier .zip dans un conteneur video valide (MKV ou MP4),
 et permet de le re-extraire bit-pour-bit.
 
-Aucune dependance externe : le conteneur Matroska est construit a la main en EBML
-(le format binaire de MKV). Pas besoin de ffmpeg ni de MKVToolNix.
+Aucune dependance externe : les deux conteneurs sont construits a la main. Pas
+besoin de ffmpeg ni de MKVToolNix.
 
 Comment ca marche
 -----------------
 Le fichier .mkv genere contient deux choses :
   1. Une vraie piste video (une image MJPEG) -> le fichier est reconnu comme une
      video valide par les lecteurs, mediainfo, ffprobe, la commande `file`, etc.
-  2. Le .zip stocke comme "piece jointe" Matroska (element AttachedFile). C'est le
-     mecanisme officiel de Matroska pour embarquer un fichier binaire arbitraire.
-     Il ressort strictement identique a l'original (aucune recompression).
+  2. Le .zip stocke tel quel, sans recompression : il ressort strictement
+     identique a l'original.
+
+Le rangement differe selon le conteneur :
+  MKV  piece jointe Matroska (element AttachedFile), le mecanisme officiel du
+       format pour embarquer un fichier binaire arbitraire.
+  MP4  MP4 n'a pas de notion de piece jointe : le .zip va dans une box 'free'
+       de premier niveau, que la norme definit explicitement comme ignorable.
 
 Usage
 -----
-  # Emballer un zip dans un mkv :
-  python3 zip2mkv.py pack  mon_archive.zip  [sortie.mkv]
+  # Emballer un zip (l'extension de sortie choisit le conteneur) :
+  python3 zip2mkv.py pack        mon_archive.zip          (-> mon_archive.mkv)
+  python3 zip2mkv.py pack --mp4  mon_archive.zip          (-> mon_archive.mp4)
 
   # Ou l'accrocher a une video que l'on a deja, qui reste lisible normalement :
   python3 zip2mkv.py attach ma_video.mkv  mon_archive.zip  [sortie.mkv]
 
-  # Re-extraire le zip depuis le mkv :
+  # Re-extraire le zip (le conteneur est detecte tout seul) :
   python3 zip2mkv.py unpack sortie.mkv      [mon_archive.zip]
 
-  # Afficher les pieces jointes contenues dans un mkv :
+  # Afficher ce qui est embarque :
   python3 zip2mkv.py info   sortie.mkv
 
 Si le nom de sortie est omis, il est deduit du nom d'entree.
@@ -198,11 +204,8 @@ def _build_attachments(zip_bytes, filename):
     return elem(ATTACHMENTS, attached)
 
 
-def pack(zip_path, mkv_path):
-    """Emballe le fichier zip_path dans un conteneur MKV valide (mkv_path)."""
-    with open(zip_path, 'rb') as f:
-        zip_bytes = f.read()
-
+def _pack_mkv(zip_bytes, name):
+    """Renvoie les octets d'un conteneur MKV embarquant zip_bytes."""
     segment_body = (
         _build_info() +
         _build_tracks() +
@@ -212,24 +215,53 @@ def pack(zip_path, mkv_path):
         # script le trouverait quand meme, car il parcourt tout le fichier,
         # mais aucun autre outil ne le verrait). Verifie avec
         # `ffmpeg -dump_attachment`.
-        _build_attachments(zip_bytes, os.path.basename(zip_path)) +
+        _build_attachments(zip_bytes, name) +
         _build_cluster()
     )
-    data = _build_ebml_header() + elem(SEGMENT, segment_body)
+    return _build_ebml_header() + elem(SEGMENT, segment_body)
 
-    with open(mkv_path, 'wb') as f:
+
+def pack(zip_path, out_path):
+    """Emballe zip_path dans un conteneur video valide (out_path).
+
+    L'extension de sortie choisit le conteneur : .mp4/.m4v donnent un MP4,
+    tout le reste donne un MKV."""
+    with open(zip_path, 'rb') as f:
+        zip_bytes = f.read()
+    name = os.path.basename(zip_path)
+
+    if os.path.splitext(out_path)[1].lower() in ('.mp4', '.m4v'):
+        kind, data = 'MP4', _pack_mp4(zip_bytes, name)
+    else:
+        kind, data = 'MKV', _pack_mkv(zip_bytes, name)
+
+    with open(out_path, 'wb') as f:
         f.write(data)
 
-    print("[OK] MKV cree : {}".format(mkv_path))
-    print("     zip embarque : {} ({} octets)".format(
-        os.path.basename(zip_path), len(zip_bytes)))
+    print("[OK] {} cree : {}".format(kind, out_path))
+    print("     zip embarque : {} ({} octets)".format(name, len(zip_bytes)))
     print("     taille finale : {} octets".format(len(data)))
 
 
 # ---------------------------------------------------------------------------
 # Lecture EBML (extraction)
 # ---------------------------------------------------------------------------
-def attach(video_path, zip_path, out_path):
+def _copy_stream(src, dst, length=None):
+    """Recopie des octets sans charger le fichier en memoire."""
+    remaining = length
+    while True:
+        want = 1 << 20 if remaining is None else min(1 << 20, remaining)
+        if want <= 0:
+            return
+        chunk = src.read(want)
+        if not chunk:
+            return
+        dst.write(chunk)
+        if remaining is not None:
+            remaining -= len(chunk)
+
+
+def _attach_mkv(video_path, zip_bytes, name, out_path):
     """Ajoute une piece jointe a une video MKV existante, sans la modifier.
 
     L'element Attachments est ajoute a la fin des donnees du Segment, et seule
@@ -240,9 +272,6 @@ def attach(video_path, zip_path, out_path):
 
     Contrepartie : la piece jointe se retrouve apres le premier Cluster, donc
     seuls ce script la verra (voir le commentaire dans pack)."""
-    with open(zip_path, 'rb') as f:
-        zip_bytes = f.read()
-    name = os.path.basename(zip_path)
     attachments = _build_attachments(zip_bytes, name)
 
     with open(video_path, 'rb') as f:
@@ -269,25 +298,11 @@ def attach(video_path, zip_path, out_path):
         seg_data_start = f.tell()
         old_vint_len = seg_data_start - size_pos
 
-    def _copy(src, dst, length=None):
-        """Recopie sans charger le fichier en memoire."""
-        remaining = length
-        while True:
-            want = 1 << 20 if remaining is None else min(1 << 20, remaining)
-            if want <= 0:
-                return
-            chunk = src.read(want)
-            if not chunk:
-                return
-            dst.write(chunk)
-            if remaining is not None:
-                remaining -= len(chunk)
-
     if seg_size is None:
         # Segment de taille inconnue : il va jusqu'a la fin du fichier, il
         # suffit donc d'ajouter les pieces jointes a la suite.
         with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
-            _copy(src, dst)
+            _copy_stream(src, dst)
             dst.write(attachments)
     else:
         seg_end = seg_data_start + seg_size
@@ -306,19 +321,13 @@ def attach(video_path, zip_path, out_path):
                 old_vint_len, 'big')
 
         with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
-            _copy(src, dst, size_pos)       # en-tete EBML + identifiant Segment
+            _copy_stream(src, dst, size_pos)       # en-tete EBML + identifiant Segment
             dst.write(new_vint)
             src.seek(seg_data_start)
-            _copy(src, dst, seg_size)       # contenu original du Segment
+            _copy_stream(src, dst, seg_size)       # contenu original du Segment
             dst.write(attachments)
 
-    before = os.path.getsize(video_path)
-    after = os.path.getsize(out_path)
-    print("[OK] MKV cree : {}".format(out_path))
-    print("     video porteuse : {} ({} octets, inchangee)".format(
-        os.path.basename(video_path), before))
-    print("     zip embarque : {} ({} octets)".format(name, len(zip_bytes)))
-    print("     taille finale : {} octets  (+{})".format(after, after - before))
+
 
 
 def _read_id(f):
@@ -420,11 +429,299 @@ def _iter_attachments(path):
     return results
 
 
-def unpack(mkv_path, out_path=None):
-    """Extrait la (premiere) piece jointe zip depuis un MKV cree par ce script."""
-    atts = _iter_attachments(mkv_path)
+# ---------------------------------------------------------------------------
+# MP4 / ISOBMFF
+# ---------------------------------------------------------------------------
+# MP4 n'a aucun equivalent des pieces jointes Matroska. La charge utile est
+# donc rangee dans une box 'free' de premier niveau : la norme ISO/IEC 14496-12
+# precise que le contenu d'une box 'free' n'a aucune signification et peut etre
+# ignore, si bien que tout lecteur conforme la saute sans broncher.
+#
+# Contenu de la box 'free' :
+#     magie       8 octets   b'ZIP2VID\x00'
+#     version     1 octet
+#     nom_len     2 octets   gros-boutiste, puis le nom UTF-8
+#     mime_len    2 octets   gros-boutiste, puis le type MIME UTF-8
+#     data_len    8 octets   gros-boutiste
+#     data        le fichier embarque, tel quel
+MP4_MAGIC = b'ZIP2VID\x00'
+MP4_PAYLOAD_VERSION = 1
+
+# Une image cle H.264 320x240 (Constrained Baseline) en forme AVCC (longueur sur
+# 4 octets + unite NAL), et son AVCDecoderConfigurationRecord. Integrees en dur
+# pour que le script reste sans dependance.
+_AVCC_RECORD = base64.b64decode(
+    "AULAHv/hABlnQsAephEFB+wEQAAAAwBAAAADAIPFi4RgAQAGaMhCDyyA")
+_FRAME_H264 = base64.b64decode(
+    "AAAA82WIggK///+HooAAoW+Tk5OTk5OTk5OTk5OTk5OTk5OTrrrrrrrrrrrrrrrrrrrr"
+    "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrwA==")
+
+_MP4_WIDTH     = 320
+_MP4_HEIGHT    = 240
+_MP4_TIMESCALE = 1000            # 1 unite = 1 ms
+_MP4_DURATION  = 1000            # ~1 s
+
+# Matrice de transformation identite (virgule fixe 16.16, derniere ligne 2.30).
+_MP4_MATRIX = struct.pack('>9i', 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
+
+
+def _box(box_type, payload):
+    """Construit une box ISOBMFF : taille + type + donnees."""
+    size = len(payload) + 8
+    if size <= 0xFFFFFFFF:
+        return struct.pack('>I', size) + box_type + payload
+    # Box hors gabarit : le champ taille vaut 1 et une taille 64 bits suit.
+    return struct.pack('>I', 1) + box_type + struct.pack('>Q', size + 8) + payload
+
+
+def _fullbox(box_type, version, flags, payload):
+    """Construit une FullBox ISOBMFF (box prefixee version + drapeaux 24 bits)."""
+    return _box(box_type, struct.pack('>BBBB', version,
+                                      (flags >> 16) & 0xFF,
+                                      (flags >> 8) & 0xFF,
+                                      flags & 0xFF) + payload)
+
+
+def _build_mp4_payload_box(zip_bytes, name, mime='application/zip'):
+    """Construit la box 'free' de premier niveau contenant le fichier."""
+    name_b = name.encode('utf-8')
+    mime_b = mime.encode('utf-8')
+    body = (MP4_MAGIC +
+            bytes([MP4_PAYLOAD_VERSION]) +
+            struct.pack('>H', len(name_b)) + name_b +
+            struct.pack('>H', len(mime_b)) + mime_b +
+            struct.pack('>Q', len(zip_bytes)) +
+            zip_bytes)
+    return _box(b'free', body)
+
+
+def _build_mp4_stbl(chunk_offset):
+    """Table des echantillons. chunk_offset = position absolue des donnees mdat."""
+    compressor = b'\x00' * 32          # chaine prefixee par sa longueur, vide
+    avc1_body = (
+        b'\x00' * 6 +                          # reserve
+        struct.pack('>H', 1) +                 # data_reference_index
+        b'\x00' * 2 + b'\x00' * 2 + b'\x00' * 12 +
+        struct.pack('>HH', _MP4_WIDTH, _MP4_HEIGHT) +
+        struct.pack('>II', 0x00480000, 0x00480000) +  # 72 dpi horizontal/vertical
+        struct.pack('>I', 0) +                 # reserve
+        struct.pack('>H', 1) +                 # frame_count
+        compressor +
+        struct.pack('>H', 0x0018) +            # profondeur
+        struct.pack('>h', -1) +                # pre_defined
+        _box(b'avcC', _AVCC_RECORD)
+    )
+    stsd = _fullbox(b'stsd', 0, 0,
+                    struct.pack('>I', 1) + _box(b'avc1', avc1_body))
+    stts = _fullbox(b'stts', 0, 0,
+                    struct.pack('>I', 1) +
+                    struct.pack('>II', 1, _MP4_DURATION))
+    stsc = _fullbox(b'stsc', 0, 0,
+                    struct.pack('>I', 1) +
+                    struct.pack('>III', 1, 1, 1))
+    stsz = _fullbox(b'stsz', 0, 0,
+                    struct.pack('>II', len(_FRAME_H264), 1))
+    stco = _fullbox(b'stco', 0, 0,
+                    struct.pack('>I', 1) + struct.pack('>I', chunk_offset))
+    return _box(b'stbl', stsd + stts + stsc + stsz + stco)
+
+
+def _build_mp4_moov(chunk_offset):
+    """Construit la box moov decrivant la piste video d'une seule image."""
+    mvhd = _fullbox(b'mvhd', 0, 0,
+                    struct.pack('>IIII', 0, 0, _MP4_TIMESCALE, _MP4_DURATION) +
+                    struct.pack('>I', 0x00010000) +   # vitesse 1.0
+                    struct.pack('>H', 0x0100) +       # volume 1.0
+                    b'\x00' * 2 + b'\x00' * 8 +
+                    _MP4_MATRIX +
+                    b'\x00' * 24 +
+                    struct.pack('>I', 2))             # next_track_ID
+
+    tkhd = _fullbox(b'tkhd', 0, 0x000003,             # active | dans le film
+                    struct.pack('>IIII', 0, 0, 1, 0) +
+                    struct.pack('>I', _MP4_DURATION) +
+                    b'\x00' * 8 +
+                    struct.pack('>hhh', 0, 0, 0) +    # couche, groupe, volume
+                    b'\x00' * 2 +
+                    _MP4_MATRIX +
+                    struct.pack('>II', _MP4_WIDTH << 16, _MP4_HEIGHT << 16))
+
+    mdhd = _fullbox(b'mdhd', 0, 0,
+                    struct.pack('>IIII', 0, 0, _MP4_TIMESCALE, _MP4_DURATION) +
+                    struct.pack('>H', 0x55C4) +       # langue 'und'
+                    struct.pack('>H', 0))
+
+    hdlr = _fullbox(b'hdlr', 0, 0,
+                    struct.pack('>I', 0) + b'vide' + b'\x00' * 12 +
+                    b'VideoHandler\x00')
+
+    vmhd = _fullbox(b'vmhd', 0, 0x000001,
+                    struct.pack('>HHHH', 0, 0, 0, 0))
+
+    dref = _fullbox(b'dref', 0, 0,
+                    struct.pack('>I', 1) +
+                    _fullbox(b'url ', 0, 0x000001, b''))   # donnees locales
+    dinf = _box(b'dinf', dref)
+
+    minf = _box(b'minf', vmhd + dinf + _build_mp4_stbl(chunk_offset))
+    mdia = _box(b'mdia', mdhd + hdlr + minf)
+    trak = _box(b'trak', tkhd + mdia)
+    return _box(b'moov', mvhd + trak)
+
+
+def _pack_mp4(zip_bytes, name):
+    """Renvoie les octets d'un MP4 embarquant zip_bytes dans une box 'free'."""
+    ftyp = _box(b'ftyp',
+                b'isom' + struct.pack('>I', 0x200) +
+                b'isom' + b'iso2' + b'avc1' + b'mp41')
+    free = _build_mp4_payload_box(zip_bytes, name)
+    mdat = _box(b'mdat', _FRAME_H264)
+
+    # stco contient une position absolue dans le fichier : moov doit donc etre
+    # construit en dernier, une fois connue la taille de ce qui precede mdat.
+    chunk_offset = len(ftyp) + len(free) + 8
+    return ftyp + free + mdat + _build_mp4_moov(chunk_offset)
+
+
+def _mp4_boxes(f, filesize):
+    """Parcourt les box de premier niveau : (type, debut_donnees, taille_box)."""
+    offset = 0
+    while offset < filesize - 7:
+        f.seek(offset)
+        head = f.read(8)
+        if len(head) < 8:
+            return
+        size = struct.unpack('>I', head[0:4])[0]
+        box_type = head[4:8]
+        body = offset + 8
+        if size == 1:                       # taille 64 bits
+            size = struct.unpack('>Q', f.read(8))[0]
+            body = offset + 16
+        elif size == 0:                     # va jusqu'a la fin du fichier
+            size = filesize - offset
+        if size < 8 or offset + size > filesize:
+            return
+        yield box_type, body, offset, size
+        offset += size
+
+
+def _mp4_attachments(path):
+    """Renvoie les charges utiles embarquees dans un MP4.
+
+    Meme forme que _iter_attachments : name, mime, offset, size, ou offset et
+    size designent les octets bruts (rien n'est charge en memoire ici)."""
+    results = []
+    with open(path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        filesize = f.tell()
+        for box_type, body, _start, _size in _mp4_boxes(f, filesize):
+            if box_type not in (b'free', b'skip'):
+                continue
+            f.seek(body)
+            head = f.read(len(MP4_MAGIC) + 1 + 2)
+            if not head.startswith(MP4_MAGIC):
+                continue
+            name_len = struct.unpack('>H', head[-2:])[0]
+            name = f.read(name_len).decode('utf-8', 'replace')
+            mime_len = struct.unpack('>H', f.read(2))[0]
+            mime = f.read(mime_len).decode('utf-8', 'replace')
+            data_len = struct.unpack('>Q', f.read(8))[0]
+            results.append({'name': name, 'mime': mime,
+                            'offset': f.tell(), 'size': data_len})
+    return results
+
+
+def _attach_mp4(video_path, zip_bytes, name, out_path):
+    """Recopie un MP4 et ajoute la charge utile en box 'free' a la toute fin.
+
+    Les positions de morceaux (stco/co64) sont des positions absolues dans le
+    fichier : ajouter a la fin est la seule modification qui ne peut pas les
+    invalider. Rien de ce qui existait deja ne bouge."""
+    # Une box peut declarer une taille 0, ce qui signifie "jusqu'a la fin du
+    # fichier". Ajouter apres une telle box l'engloutirait silencieusement : il
+    # faut donc d'abord ecrire sa vraie taille.
+    fix = None
+    with open(video_path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        filesize = f.tell()
+        for box_type, _body, start, size in _mp4_boxes(f, filesize):
+            if start + size == filesize:
+                f.seek(start)
+                if struct.unpack('>I', f.read(4))[0] == 0:
+                    fix = (start, size)
+
+    box = _build_mp4_payload_box(zip_bytes, name)
+    with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
+        _copy_stream(src, dst)
+        dst.write(box)
+
+    if fix is not None:
+        start, real_size = fix
+        if real_size > 0xFFFFFFFF:
+            raise SystemExit(
+                "[ERREUR] {} se termine par une box ouverte de plus de 4 Go ;\n"
+                "         la reecrire demanderait une taille 64 bits."
+                .format(video_path))
+        with open(out_path, 'r+b') as dst:
+            dst.seek(start)
+            dst.write(struct.pack('>I', real_size))
+
+
+# ---------------------------------------------------------------------------
+# Aiguillage entre conteneurs
+# ---------------------------------------------------------------------------
+def detect_container(path):
+    """Renvoie 'mkv' ou 'mp4' en reniflant la signature du fichier."""
+    with open(path, 'rb') as f:
+        head = f.read(12)
+    if head.startswith(EBML):
+        return 'mkv'
+    if len(head) >= 8 and head[4:8] in (b'ftyp', b'moov', b'mdat', b'free'):
+        return 'mp4'
+    raise SystemExit(
+        "[ERREUR] {} n'est ni un fichier Matroska ni un MP4.".format(path))
+
+
+def _attachments(path):
+    """Renvoie les pieces jointes, quel que soit le conteneur."""
+    if detect_container(path) == 'mkv':
+        return _iter_attachments(path)
+    return _mp4_attachments(path)
+
+
+def attach(video_path, zip_path, out_path):
+    """Accroche un fichier a une video existante, qui reste lisible."""
+    kind = detect_container(video_path)
+    with open(zip_path, 'rb') as f:
+        zip_bytes = f.read()
+    name = os.path.basename(zip_path)
+
+    if kind == 'mkv':
+        _attach_mkv(video_path, zip_bytes, name, out_path)
+    else:
+        _attach_mp4(video_path, zip_bytes, name, out_path)
+
+    before = os.path.getsize(video_path)
+    after = os.path.getsize(out_path)
+    print("[OK] {} cree : {}".format(kind.upper(), out_path))
+    print("     video porteuse : {} ({} octets, inchangee)".format(
+        os.path.basename(video_path), before))
+    print("     zip embarque : {} ({} octets)".format(name, len(zip_bytes)))
+    print("     taille finale : {} octets  (+{})".format(after, after - before))
+
+
+def unpack(video_path, out_path=None):
+    """Extrait la (premiere) piece jointe depuis un MKV ou un MP4."""
+    atts = _attachments(video_path)
     if not atts:
-        raise SystemExit("[ERREUR] Aucune piece jointe trouvee dans {}".format(mkv_path))
+        raise SystemExit(
+            "[ERREUR] Aucune piece jointe trouvee dans {}\n"
+            "         (si le fichier est passe par un hebergeur video, il a\n"
+            "          tres probablement ete re-encode, ce qui supprime la\n"
+            "          piece jointe)".format(video_path))
 
     # On privilegie une PJ de type zip, sinon la premiere disponible.
     chosen = next((a for a in atts if a['mime'] == 'application/zip'), atts[0])
@@ -434,7 +731,7 @@ def unpack(mkv_path, out_path=None):
     if out_path is None:
         out_path = chosen['name'] or 'sortie.zip'
 
-    with open(mkv_path, 'rb') as f:
+    with open(video_path, 'rb') as f:
         f.seek(chosen['offset'])
         data = f.read(chosen['size'])
     with open(out_path, 'wb') as f:
@@ -443,13 +740,14 @@ def unpack(mkv_path, out_path=None):
     print("[OK] zip extrait : {} ({} octets)".format(out_path, len(data)))
 
 
-def info(mkv_path):
-    """Liste les pieces jointes contenues dans le MKV."""
-    atts = _iter_attachments(mkv_path)
+def info(video_path):
+    """Liste les pieces jointes contenues dans le MKV ou le MP4."""
+    kind = detect_container(video_path)
+    atts = _attachments(video_path)
     if not atts:
         print("Aucune piece jointe.")
         return
-    print("Pieces jointes dans {} :".format(mkv_path))
+    print("Pieces jointes dans {} ({}) :".format(video_path, kind.upper()))
     for i, a in enumerate(atts, 1):
         print("  {}. {}  [{}]  {} octets".format(
             i, a['name'], a['mime'], a['size']))
@@ -470,11 +768,19 @@ def main(argv):
     cmd = argv[1]
 
     if cmd == 'pack':
-        if len(argv) < 3:
+        rest = argv[2:]
+        # --mp4 / --mkv ne servent que si le nom de sortie est laisse implicite.
+        default_ext = '.mkv'
+        for flag, ext in (('--mp4', '.mp4'), ('--mkv', '.mkv')):
+            if flag in rest:
+                rest = [a for a in rest if a != flag]
+                default_ext = ext
+        if not rest:
             _usage(); return 1
-        zip_path = argv[2]
-        mkv_path = argv[3] if len(argv) > 3 else os.path.splitext(zip_path)[0] + '.mkv'
-        pack(zip_path, mkv_path)
+        zip_path = rest[0]
+        out_path = rest[1] if len(rest) > 1 else \
+            os.path.splitext(zip_path)[0] + default_ext
+        pack(zip_path, out_path)
 
     elif cmd == 'attach':
         if len(argv) < 4:
