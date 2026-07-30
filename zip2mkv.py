@@ -1,51 +1,190 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-zip2mkv.py — Encapsule un fichier .zip dans un conteneur video valide (MKV ou MP4),
-et permet de le re-extraire bit-pour-bit.
+zip2mkv.py - Wrap a .zip file inside a valid video container (MKV or MP4),
+and extract it back bit-for-bit.
 
-Aucune dependance externe : les deux conteneurs sont construits a la main. Pas
-besoin de ffmpeg ni de MKVToolNix.
+No external dependency: both containers are built by hand. No ffmpeg, no
+MKVToolNix required.
 
-Comment ca marche
------------------
-Le fichier .mkv genere contient deux choses :
-  1. Une vraie piste video (une image MJPEG) -> le fichier est reconnu comme une
-     video valide par les lecteurs, mediainfo, ffprobe, la commande `file`, etc.
-  2. Le .zip stocke tel quel, sans recompression : il ressort strictement
-     identique a l'original.
+How it works
+------------
+The generated file holds two things:
+  1. A real video track (one MJPEG frame) -> the file is recognised as a valid
+     video by players, mediainfo, ffprobe, the `file` command, etc.
+  2. The .zip stored as-is, no re-compression: it comes back strictly identical
+     to the original.
 
-Le rangement differe selon le conteneur :
-  MKV  piece jointe Matroska (element AttachedFile), le mecanisme officiel du
-       format pour embarquer un fichier binaire arbitraire.
-  MP4  MP4 n'a pas de notion de piece jointe : le .zip va dans une box 'free'
-       de premier niveau, que la norme definit explicitement comme ignorable.
+Storage differs per container:
+  MKV  a Matroska attachment (AttachedFile element), the format's official
+       mechanism for embedding an arbitrary binary file.
+  MP4  MP4 has no attachment concept, so the .zip goes into a top-level 'free'
+       box, which the spec explicitly defines as skippable.
+
+Encryption
+----------
+The payload is encrypted. For pack and attach, the key is read from key/key.txt
+if that file exists, otherwise it is asked for at the keyboard. For unpack the
+key is ALWAYS asked for at the keyboard (key.txt is ignored). Outputs go into
+pack/ and unpack/, created as needed.
 
 Usage
 -----
-  # Emballer un zip (l'extension de sortie choisit le conteneur) :
-  python3 zip2mkv.py pack        mon_archive.zip          (-> mon_archive.mkv)
-  python3 zip2mkv.py pack --mp4  mon_archive.zip          (-> mon_archive.mp4)
+  # Pack a zip (the output extension picks the container):
+  python3 zip2mkv.py pack        my_archive.zip          (-> pack/my_archive.mkv)
+  python3 zip2mkv.py pack --mp4  my_archive.zip          (-> pack/my_archive.mp4)
 
-  # Ou l'accrocher a une video que l'on a deja, qui reste lisible normalement :
-  python3 zip2mkv.py attach ma_video.mkv  mon_archive.zip  [sortie.mkv]
+  # Or attach it to a video you already have, which keeps playing normally:
+  python3 zip2mkv.py attach my_video.mkv  my_archive.zip  [output.mkv]
 
-  # Re-extraire le zip (le conteneur est detecte tout seul) :
-  python3 zip2mkv.py unpack sortie.mkv      [mon_archive.zip]
+  # Extract the zip back (the container is detected automatically):
+  python3 zip2mkv.py unpack output.mkv      [my_archive.zip]
 
-  # Afficher ce qui est embarque :
-  python3 zip2mkv.py info   sortie.mkv
+  # Show what is embedded:
+  python3 zip2mkv.py info   output.mkv
 
-Si le nom de sortie est omis, il est deduit du nom d'entree.
+If the output name is omitted, it is derived from the input name.
 """
 
 import base64
+import hashlib
+import hmac
 import os
+import secrets
 import struct
 import sys
 
 # ---------------------------------------------------------------------------
-# Identifiants des elements EBML/Matroska (octets bruts, marqueur VINT inclus)
+# Configuration: key, input/output folders
+# ---------------------------------------------------------------------------
+# Everything is resolved relative to the script's folder, not the current
+# directory, so Windows drag-and-drop works wherever it is launched from.
+KEY_FILE   = os.path.join('key', 'key.txt')
+PACK_DIR   = 'pack'
+UNPACK_DIR = 'unpack'
+
+# Header of an encrypted payload, written in front of the ciphertext:
+#   magic 8 | salt 16 | nonce 16 | mac 32   then the ciphertext
+ENC_MAGIC   = b'Z2KENC\x00\x01'
+_SALT_LEN   = 16
+_NONCE_LEN  = 16
+_MAC_LEN    = 32
+_PBKDF2_ITER = 200_000
+_KS_BLOCK    = 1 << 16           # 64 KiB of keystream per SHAKE256 call
+
+
+def _base_dir():
+    """The script's folder, where key/, pack/ and unpack/ are resolved."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _key_from_file():
+    """Return the key from key/key.txt, or None if the file is missing/empty.
+
+    The first non-empty line that is not a comment (#) is taken, so the file can
+    be commented without breaking the read."""
+    path = os.path.join(_base_dir(), KEY_FILE)
+    if not os.path.isfile(path):
+        return None
+    with open(path, 'rb') as f:
+        for raw in f:
+            line = raw.strip()
+            if line and not line.startswith(b'#'):
+                return line
+    return None
+
+
+def _prompt_key(prompt):
+    """Ask for a key at the keyboard, without echoing it (like a password)."""
+    import getpass
+    try:
+        entered = getpass.getpass(prompt)
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("\n[ERROR] No key provided.")
+    key = entered.strip().encode('utf-8')
+    if not key:
+        raise SystemExit("[ERROR] Empty key.")
+    return key
+
+
+def key_for_pack():
+    """Key for pack/attach: key/key.txt if it exists, otherwise ask for it."""
+    return _key_from_file() or _prompt_key("Encryption key: ")
+
+
+def key_for_unpack():
+    """Key for unpack: always asked at the keyboard, key.txt is ignored."""
+    return _prompt_key("Decryption key: ")
+
+
+def _derive(key, salt):
+    """Derive separate encryption and authentication keys."""
+    dk = hashlib.pbkdf2_hmac('sha256', key, salt, _PBKDF2_ITER, dklen=64)
+    return dk[:32], dk[32:]
+
+
+def _keystream_xor(enc_key, nonce, data):
+    """XOR data with a SHAKE256 keystream in counter mode.
+
+    SHAKE256 is an extendable-output function: called with (key, nonce, counter)
+    it yields a pseudo-random stream. The counter is part of each block's input,
+    so no keystream block ever repeats."""
+    out = bytearray(len(data))
+    for i in range(0, len(data), _KS_BLOCK):
+        chunk = data[i:i + _KS_BLOCK]
+        block = hashlib.shake_256(
+            enc_key + nonce + (i // _KS_BLOCK).to_bytes(8, 'big')
+        ).digest(len(chunk))
+        out[i:i + len(chunk)] = bytes(a ^ b for a, b in zip(chunk, block))
+    return bytes(out)
+
+
+def encrypt(data, key):
+    """Encrypt data. Returns magic + salt + nonce + mac + ciphertext."""
+    salt = secrets.token_bytes(_SALT_LEN)
+    nonce = secrets.token_bytes(_NONCE_LEN)
+    enc_key, mac_key = _derive(key, salt)
+    cipher = _keystream_xor(enc_key, nonce, data)
+    # Encrypt-then-MAC: the MAC covers the header AND the ciphertext, so any
+    # tampering is caught before we decrypt anything.
+    mac = hmac.new(mac_key, ENC_MAGIC + salt + nonce + cipher, 'sha256').digest()
+    return ENC_MAGIC + salt + nonce + mac + cipher
+
+
+def is_encrypted(blob):
+    return blob[:len(ENC_MAGIC)] == ENC_MAGIC
+
+
+def decrypt(blob, key):
+    """Decrypt a blob produced by encrypt(). Checks the MAC first."""
+    head = len(ENC_MAGIC) + _SALT_LEN + _NONCE_LEN + _MAC_LEN
+    if len(blob) < head:
+        raise SystemExit("[ERROR] Encrypted payload is truncated.")
+    off = len(ENC_MAGIC)
+    salt = blob[off:off + _SALT_LEN]; off += _SALT_LEN
+    nonce = blob[off:off + _NONCE_LEN]; off += _NONCE_LEN
+    mac = blob[off:off + _MAC_LEN]; off += _MAC_LEN
+    cipher = blob[off:]
+
+    enc_key, mac_key = _derive(key, salt)
+    expected = hmac.new(mac_key, ENC_MAGIC + salt + nonce + cipher,
+                        'sha256').digest()
+    if not hmac.compare_digest(mac, expected):
+        raise SystemExit(
+            "[ERROR] Verification failed: wrong key, or the file was altered.\n"
+            "        Nothing was written. Refusing to output bogus bytes.")
+    return _keystream_xor(enc_key, nonce, cipher)
+
+
+def _output_path(dirname, filename):
+    """Return the path inside dirname, creating the folder if needed."""
+    folder = os.path.join(_base_dir(), dirname)
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, os.path.basename(filename))
+
+
+# ---------------------------------------------------------------------------
+# EBML/Matroska element IDs (raw bytes, VINT marker included)
 # ---------------------------------------------------------------------------
 EBML                 = b'\x1A\x45\xDF\xA3'
 EBML_VERSION         = b'\x42\x86'
@@ -87,8 +226,8 @@ FILE_MIME_TYPE       = b'\x46\x60'
 FILE_DATA            = b'\x46\x5C'
 FILE_UID             = b'\x46\xAE'
 
-# Une petite image JPEG 320x240 valide, utilisee comme unique frame de la piste
-# video. Integree en dur pour que le script n'ait aucune dependance.
+# A small valid 320x240 JPEG image, used as the single frame of the video track.
+# Embedded inline so the script has no dependency.
 _FRAME_JPEG = base64.b64decode(
     "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIf"
     "IiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7"
@@ -137,19 +276,19 @@ _FRAME_JPEG = base64.b64decode(
 
 
 # ---------------------------------------------------------------------------
-# Ecriture EBML
+# EBML writing
 # ---------------------------------------------------------------------------
 def encode_size(n):
-    """Encode une taille en VINT (Variable-length INTeger) Matroska."""
+    """Encode a size as a Matroska VINT (Variable-length INTeger)."""
     for length in range(1, 9):
-        limit = (1 << (7 * length)) - 1          # la valeur "tout a 1" est reservee
+        limit = (1 << (7 * length)) - 1          # the all-ones value is reserved
         if n < limit:
             return (n | (1 << (7 * length))).to_bytes(length, 'big')
-    raise ValueError("taille trop grande pour un VINT")
+    raise ValueError("size too large for a VINT")
 
 
 def elem(elem_id, data):
-    """Construit un element EBML : identifiant + taille + donnees."""
+    """Build an EBML element: id + size + data."""
     return elem_id + encode_size(len(data)) + data
 
 
@@ -187,7 +326,7 @@ def _build_tracks():
 
 
 def _build_cluster():
-    # SimpleBlock : numero de piste (VINT) + timecode int16 + flags + donnees
+    # SimpleBlock: track number (VINT) + int16 timecode + flags + frame data
     block = b'\x81' + (0).to_bytes(2, 'big') + b'\x80' + _FRAME_JPEG   # 0x80 = keyframe
     return elem(CLUSTER,
         elem(TIMESTAMP, b'\x00') +
@@ -196,7 +335,7 @@ def _build_cluster():
 
 def _build_attachments(zip_bytes, filename):
     attached = elem(ATTACHED_FILE,
-        elem(FILE_DESCRIPTION, "Archive zip embarquee".encode('utf-8')) +
+        elem(FILE_DESCRIPTION, "Embedded zip archive".encode('utf-8')) +
         elem(FILE_NAME,        filename.encode('utf-8')) +
         elem(FILE_MIME_TYPE,   b'application/zip') +
         elem(FILE_DATA,        zip_bytes) +
@@ -205,16 +344,15 @@ def _build_attachments(zip_bytes, filename):
 
 
 def _pack_mkv(zip_bytes, name):
-    """Renvoie les octets d'un conteneur MKV embarquant zip_bytes."""
+    """Return the bytes of an MKV container embedding zip_bytes."""
     segment_body = (
         _build_info() +
         _build_tracks() +
-        # Attachments DOIT preceder le premier Cluster : les lecteurs arretent
-        # de parcourir les elements d'en-tete des qu'ils rencontrent un Cluster.
-        # Place apres, l'element est invisible pour ffmpeg et mkvextract (ce
-        # script le trouverait quand meme, car il parcourt tout le fichier,
-        # mais aucun autre outil ne le verrait). Verifie avec
-        # `ffmpeg -dump_attachment`.
+        # Attachments MUST come before the first Cluster: parsers stop reading
+        # header-level elements once they hit a Cluster, so an attachment placed
+        # after it is invisible to ffmpeg and mkvextract (this script would still
+        # find it, since it walks the whole file, but nothing else would).
+        # Verified with `ffmpeg -dump_attachment`.
         _build_attachments(zip_bytes, name) +
         _build_cluster()
     )
@@ -222,32 +360,41 @@ def _pack_mkv(zip_bytes, name):
 
 
 def pack(zip_path, out_path):
-    """Emballe zip_path dans un conteneur video valide (out_path).
+    """Wrap zip_path into a valid video container (out_path).
 
-    L'extension de sortie choisit le conteneur : .mp4/.m4v donnent un MP4,
-    tout le reste donne un MKV."""
+    The payload is encrypted with the key from key/key.txt if that file exists,
+    otherwise the key is asked for at the keyboard. The result is placed in the
+    pack/ folder (created if missing).
+
+    The output extension picks the container: .mp4/.m4v give an MP4, anything
+    else gives an MKV."""
+    _need_file(zip_path, "File to pack")
+    key = key_for_pack()
     with open(zip_path, 'rb') as f:
-        zip_bytes = f.read()
+        clear = f.read()
     name = os.path.basename(zip_path)
+    payload = encrypt(clear, key)
 
     if os.path.splitext(out_path)[1].lower() in ('.mp4', '.m4v'):
-        kind, data = 'MP4', _pack_mp4(zip_bytes, name)
+        kind, data = 'MP4', _pack_mp4(payload, name)
     else:
-        kind, data = 'MKV', _pack_mkv(zip_bytes, name)
+        kind, data = 'MKV', _pack_mkv(payload, name)
 
-    with open(out_path, 'wb') as f:
+    final = _output_path(PACK_DIR, out_path)
+    with open(final, 'wb') as f:
         f.write(data)
 
-    print("[OK] {} cree : {}".format(kind, out_path))
-    print("     zip embarque : {} ({} octets)".format(name, len(zip_bytes)))
-    print("     taille finale : {} octets".format(len(data)))
+    print("[OK] {} created: {}".format(kind, final))
+    print("     embedded zip: {} ({} bytes clear)".format(name, len(clear)))
+    print("     encrypted: yes ({} bytes once encrypted)".format(len(payload)))
+    print("     final size: {} bytes".format(len(data)))
 
 
 # ---------------------------------------------------------------------------
-# Lecture EBML (extraction)
+# EBML reading (extraction)
 # ---------------------------------------------------------------------------
 def _copy_stream(src, dst, length=None):
-    """Recopie des octets sans charger le fichier en memoire."""
+    """Copy bytes without loading the file into memory."""
     remaining = length
     while True:
         want = 1 << 20 if remaining is None else min(1 << 20, remaining)
@@ -262,16 +409,15 @@ def _copy_stream(src, dst, length=None):
 
 
 def _attach_mkv(video_path, zip_bytes, name, out_path):
-    """Ajoute une piece jointe a une video MKV existante, sans la modifier.
+    """Add an attachment to an existing MKV video without altering it.
 
-    L'element Attachments est ajoute a la fin des donnees du Segment, et seule
-    la taille du Segment est reecrite. Les positions stockees dans Cues et
-    SeekHead sont relatives au debut des donnees du Segment : elles restent
-    donc valides meme si ce champ de taille gagne un octet. Rien de ce qui
-    existait deja dans le fichier ne bouge.
+    The Attachments element is appended at the end of the Segment's data, and
+    only the Segment size field is rewritten. Positions stored in Cues and
+    SeekHead are relative to the start of the Segment data, so they stay valid
+    even if that size field grows a byte. Nothing already in the file moves.
 
-    Contrepartie : la piece jointe se retrouve apres le premier Cluster, donc
-    seuls ce script la verra (voir le commentaire dans pack)."""
+    Trade-off: the attachment ends up after the first Cluster, so only this
+    script will find it (see the comment in pack)."""
     attachments = _build_attachments(zip_bytes, name)
 
     with open(video_path, 'rb') as f:
@@ -281,26 +427,26 @@ def _attach_mkv(video_path, zip_bytes, name, out_path):
 
         if _read_id(f) != EBML:
             raise SystemExit(
-                "[ERREUR] {} n'est pas un fichier Matroska.".format(video_path))
-        # En deux temps : _read_size avance le curseur, donc f.tell() doit etre
-        # lu APRES, sinon header_end est decale de la longueur du champ taille.
+                "[ERROR] {} is not a Matroska file.".format(video_path))
+        # In two steps: _read_size advances the cursor, so f.tell() must be read
+        # AFTER, otherwise header_end is off by the size field's length.
         ebml_size = _read_size(f)
         header_end = f.tell() + ebml_size
 
         f.seek(header_end)
         if _read_id(f) != SEGMENT:
             raise SystemExit(
-                "[ERREUR] {} : Segment attendu apres l'en-tete EBML.\n"
-                "         Ce fichier est trop inhabituel pour etre modifie ici."
+                "[ERROR] {}: expected a Segment after the EBML header.\n"
+                "        This file is too unusual to be edited here."
                 .format(video_path))
         size_pos = f.tell()
-        seg_size = _read_size(f)            # None = taille inconnue
+        seg_size = _read_size(f)            # None = unknown size
         seg_data_start = f.tell()
         old_vint_len = seg_data_start - size_pos
 
     if seg_size is None:
-        # Segment de taille inconnue : il va jusqu'a la fin du fichier, il
-        # suffit donc d'ajouter les pieces jointes a la suite.
+        # Unknown-size Segment: it runs to the end of the file, so appending the
+        # attachments after it is enough.
         with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
             _copy_stream(src, dst)
             dst.write(attachments)
@@ -308,30 +454,27 @@ def _attach_mkv(video_path, zip_bytes, name, out_path):
         seg_end = seg_data_start + seg_size
         if seg_end != filesize:
             raise SystemExit(
-                "[ERREUR] {} : le Segment ne va pas jusqu'a la fin du fichier\n"
-                "         ({} octets le suivent). Ajouter une piece jointe les\n"
-                "         corromprait.".format(video_path, filesize - seg_end))
+                "[ERROR] {}: the Segment does not run to the end of the file\n"
+                "        ({} bytes follow it). Attaching would corrupt them."
+                .format(video_path, filesize - seg_end))
 
         new_vint = encode_size(seg_size + len(attachments))
-        # On garde la meme largeur de champ quand c'est possible, pour que
-        # rien ne se decale du tout.
+        # Keep the same field width when possible, so nothing shifts at all.
         if len(new_vint) < old_vint_len:
             marker = 1 << (7 * old_vint_len)
             new_vint = ((seg_size + len(attachments)) | marker).to_bytes(
                 old_vint_len, 'big')
 
         with open(video_path, 'rb') as src, open(out_path, 'wb') as dst:
-            _copy_stream(src, dst, size_pos)       # en-tete EBML + identifiant Segment
+            _copy_stream(src, dst, size_pos)       # EBML header + Segment id
             dst.write(new_vint)
             src.seek(seg_data_start)
-            _copy_stream(src, dst, seg_size)       # contenu original du Segment
+            _copy_stream(src, dst, seg_size)       # the original Segment content
             dst.write(attachments)
 
 
-
-
 def _read_id(f):
-    """Lit un identifiant d'element EBML (octets bruts). Retourne None a la fin."""
+    """Read an EBML element ID (raw bytes). Returns None at end of file."""
     first = f.read(1)
     if not first:
         return None
@@ -342,12 +485,12 @@ def _read_id(f):
             length = i + 1
             break
     if length == 0:
-        raise ValueError("identifiant EBML invalide")
+        raise ValueError("invalid EBML id")
     return first + f.read(length - 1)
 
 
 def _read_size(f):
-    """Lit une taille EBML (VINT). Retourne None si taille inconnue."""
+    """Read an EBML size (VINT). Returns None for unknown size."""
     first = f.read(1)
     if not first:
         return None
@@ -363,19 +506,19 @@ def _read_size(f):
         value = (value << 8) | byte
     all_ones = (1 << (7 * length)) - 1
     if value == all_ones:
-        return None                              # taille inconnue (non utilise ici)
+        return None                              # unknown size (not used here)
     return value
 
 
-# Elements "conteneurs" que l'on doit explorer recursivement pour trouver les PJ.
+# "Master" elements we recurse into to find the attachments.
 _MASTERS = {SEGMENT, ATTACHMENTS, ATTACHED_FILE}
 
 
 def _iter_attachments(path):
-    """Parcourt le MKV et renvoie la liste des pieces jointes.
+    """Walk the MKV and return the list of attachments.
 
-    Chaque PJ : dict(name, mime, offset, size) — offset/size pointent sur les
-    octets bruts de FILE_DATA (le contenu n'est pas charge en memoire ici)."""
+    Each attachment: dict(name, mime, offset, size) - offset/size point at the
+    raw bytes of FILE_DATA (the content is not loaded into memory here)."""
     results = []
 
     with open(path, 'rb') as f:
@@ -400,7 +543,7 @@ def _iter_attachments(path):
                 elif elem_id == ATTACHED_FILE:
                     att = _read_attached_file(f, data_start, data_end)
                     results.append(att)
-                # (les autres elements de haut niveau sont ignores)
+                # (other top-level elements are ignored)
                 f.seek(data_end)
 
         def _read_attached_file(f, start, end):
@@ -432,24 +575,24 @@ def _iter_attachments(path):
 # ---------------------------------------------------------------------------
 # MP4 / ISOBMFF
 # ---------------------------------------------------------------------------
-# MP4 n'a aucun equivalent des pieces jointes Matroska. La charge utile est
-# donc rangee dans une box 'free' de premier niveau : la norme ISO/IEC 14496-12
-# precise que le contenu d'une box 'free' n'a aucune signification et peut etre
-# ignore, si bien que tout lecteur conforme la saute sans broncher.
+# MP4 has no equivalent of a Matroska attachment. The payload is therefore
+# stored in a top-level 'free' box: ISO/IEC 14496-12 states that the contents of
+# a 'free' box are meaningless and may be ignored, so every conformant parser
+# skips over it without complaining.
 #
-# Contenu de la box 'free' :
-#     magie       8 octets   b'ZIP2VID\x00'
-#     version     1 octet
-#     nom_len     2 octets   gros-boutiste, puis le nom UTF-8
-#     mime_len    2 octets   gros-boutiste, puis le type MIME UTF-8
-#     data_len    8 octets   gros-boutiste
-#     data        le fichier embarque, tel quel
+# Contents of the 'free' box:
+#     magic       8 bytes   b'ZIP2VID\x00'
+#     version     1 byte
+#     name_len    2 bytes   big endian, then the UTF-8 name
+#     mime_len    2 bytes   big endian, then the UTF-8 MIME type
+#     data_len    8 bytes   big endian
+#     data        the embedded file, as-is
 MP4_MAGIC = b'ZIP2VID\x00'
 MP4_PAYLOAD_VERSION = 1
 
-# Une image cle H.264 320x240 (Constrained Baseline) en forme AVCC (longueur sur
-# 4 octets + unite NAL), et son AVCDecoderConfigurationRecord. Integrees en dur
-# pour que le script reste sans dependance.
+# A 320x240 H.264 keyframe (Constrained Baseline) in AVCC form (4-byte length
+# prefix + NAL unit), and its AVCDecoderConfigurationRecord. Embedded inline so
+# the script stays dependency-free.
 _AVCC_RECORD = base64.b64decode(
     "AULAHv/hABlnQsAephEFB+wEQAAAAwBAAAADAIPFi4RgAQAGaMhCDyyA")
 _FRAME_H264 = base64.b64decode(
@@ -461,24 +604,24 @@ _FRAME_H264 = base64.b64decode(
 
 _MP4_WIDTH     = 320
 _MP4_HEIGHT    = 240
-_MP4_TIMESCALE = 1000            # 1 unite = 1 ms
+_MP4_TIMESCALE = 1000            # 1 unit = 1 ms
 _MP4_DURATION  = 1000            # ~1 s
 
-# Matrice de transformation identite (virgule fixe 16.16, derniere ligne 2.30).
+# Identity transformation matrix (16.16 fixed point, last row 2.30).
 _MP4_MATRIX = struct.pack('>9i', 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
 
 
 def _box(box_type, payload):
-    """Construit une box ISOBMFF : taille + type + donnees."""
+    """Build an ISOBMFF box: size + type + data."""
     size = len(payload) + 8
     if size <= 0xFFFFFFFF:
         return struct.pack('>I', size) + box_type + payload
-    # Box hors gabarit : le champ taille vaut 1 et une taille 64 bits suit.
+    # Oversized box: the size field is 1 and a 64-bit size follows.
     return struct.pack('>I', 1) + box_type + struct.pack('>Q', size + 8) + payload
 
 
 def _fullbox(box_type, version, flags, payload):
-    """Construit une FullBox ISOBMFF (box prefixee version + drapeaux 24 bits)."""
+    """Build an ISOBMFF FullBox (box prefixed with version + 24-bit flags)."""
     return _box(box_type, struct.pack('>BBBB', version,
                                       (flags >> 16) & 0xFF,
                                       (flags >> 8) & 0xFF,
@@ -486,7 +629,7 @@ def _fullbox(box_type, version, flags, payload):
 
 
 def _build_mp4_payload_box(zip_bytes, name, mime='application/zip'):
-    """Construit la box 'free' de premier niveau contenant le fichier."""
+    """Build the top-level 'free' box holding the file."""
     name_b = name.encode('utf-8')
     mime_b = mime.encode('utf-8')
     body = (MP4_MAGIC +
@@ -499,18 +642,18 @@ def _build_mp4_payload_box(zip_bytes, name, mime='application/zip'):
 
 
 def _build_mp4_stbl(chunk_offset):
-    """Table des echantillons. chunk_offset = position absolue des donnees mdat."""
-    compressor = b'\x00' * 32          # chaine prefixee par sa longueur, vide
+    """Sample table. chunk_offset = absolute position of the mdat data."""
+    compressor = b'\x00' * 32          # length-prefixed string, left empty
     avc1_body = (
-        b'\x00' * 6 +                          # reserve
+        b'\x00' * 6 +                          # reserved
         struct.pack('>H', 1) +                 # data_reference_index
         b'\x00' * 2 + b'\x00' * 2 + b'\x00' * 12 +
         struct.pack('>HH', _MP4_WIDTH, _MP4_HEIGHT) +
         struct.pack('>II', 0x00480000, 0x00480000) +  # 72 dpi horizontal/vertical
-        struct.pack('>I', 0) +                 # reserve
+        struct.pack('>I', 0) +                 # reserved
         struct.pack('>H', 1) +                 # frame_count
         compressor +
-        struct.pack('>H', 0x0018) +            # profondeur
+        struct.pack('>H', 0x0018) +            # depth
         struct.pack('>h', -1) +                # pre_defined
         _box(b'avcC', _AVCC_RECORD)
     )
@@ -530,28 +673,28 @@ def _build_mp4_stbl(chunk_offset):
 
 
 def _build_mp4_moov(chunk_offset):
-    """Construit la box moov decrivant la piste video d'une seule image."""
+    """Build the moov box describing the single-frame video track."""
     mvhd = _fullbox(b'mvhd', 0, 0,
                     struct.pack('>IIII', 0, 0, _MP4_TIMESCALE, _MP4_DURATION) +
-                    struct.pack('>I', 0x00010000) +   # vitesse 1.0
+                    struct.pack('>I', 0x00010000) +   # rate 1.0
                     struct.pack('>H', 0x0100) +       # volume 1.0
                     b'\x00' * 2 + b'\x00' * 8 +
                     _MP4_MATRIX +
                     b'\x00' * 24 +
                     struct.pack('>I', 2))             # next_track_ID
 
-    tkhd = _fullbox(b'tkhd', 0, 0x000003,             # active | dans le film
+    tkhd = _fullbox(b'tkhd', 0, 0x000003,             # enabled | in movie
                     struct.pack('>IIII', 0, 0, 1, 0) +
                     struct.pack('>I', _MP4_DURATION) +
                     b'\x00' * 8 +
-                    struct.pack('>hhh', 0, 0, 0) +    # couche, groupe, volume
+                    struct.pack('>hhh', 0, 0, 0) +    # layer, alt group, volume
                     b'\x00' * 2 +
                     _MP4_MATRIX +
                     struct.pack('>II', _MP4_WIDTH << 16, _MP4_HEIGHT << 16))
 
     mdhd = _fullbox(b'mdhd', 0, 0,
                     struct.pack('>IIII', 0, 0, _MP4_TIMESCALE, _MP4_DURATION) +
-                    struct.pack('>H', 0x55C4) +       # langue 'und'
+                    struct.pack('>H', 0x55C4) +       # language 'und'
                     struct.pack('>H', 0))
 
     hdlr = _fullbox(b'hdlr', 0, 0,
@@ -563,7 +706,7 @@ def _build_mp4_moov(chunk_offset):
 
     dref = _fullbox(b'dref', 0, 0,
                     struct.pack('>I', 1) +
-                    _fullbox(b'url ', 0, 0x000001, b''))   # donnees locales
+                    _fullbox(b'url ', 0, 0x000001, b''))   # self-contained
     dinf = _box(b'dinf', dref)
 
     minf = _box(b'minf', vmhd + dinf + _build_mp4_stbl(chunk_offset))
@@ -573,21 +716,21 @@ def _build_mp4_moov(chunk_offset):
 
 
 def _pack_mp4(zip_bytes, name):
-    """Renvoie les octets d'un MP4 embarquant zip_bytes dans une box 'free'."""
+    """Return the bytes of an MP4 embedding zip_bytes in a 'free' box."""
     ftyp = _box(b'ftyp',
                 b'isom' + struct.pack('>I', 0x200) +
                 b'isom' + b'iso2' + b'avc1' + b'mp41')
     free = _build_mp4_payload_box(zip_bytes, name)
     mdat = _box(b'mdat', _FRAME_H264)
 
-    # stco contient une position absolue dans le fichier : moov doit donc etre
-    # construit en dernier, une fois connue la taille de ce qui precede mdat.
+    # stco stores an absolute file offset, so moov must be built last - once the
+    # size of everything preceding the mdat payload is known.
     chunk_offset = len(ftyp) + len(free) + 8
     return ftyp + free + mdat + _build_mp4_moov(chunk_offset)
 
 
 def _mp4_boxes(f, filesize):
-    """Parcourt les box de premier niveau : (type, debut_donnees, taille_box)."""
+    """Walk the top-level boxes: (type, data_start, box_offset, box_size)."""
     offset = 0
     while offset < filesize - 7:
         f.seek(offset)
@@ -597,10 +740,10 @@ def _mp4_boxes(f, filesize):
         size = struct.unpack('>I', head[0:4])[0]
         box_type = head[4:8]
         body = offset + 8
-        if size == 1:                       # taille 64 bits
+        if size == 1:                       # 64-bit size
             size = struct.unpack('>Q', f.read(8))[0]
             body = offset + 16
-        elif size == 0:                     # va jusqu'a la fin du fichier
+        elif size == 0:                     # runs to the end of the file
             size = filesize - offset
         if size < 8 or offset + size > filesize:
             return
@@ -609,10 +752,10 @@ def _mp4_boxes(f, filesize):
 
 
 def _mp4_attachments(path):
-    """Renvoie les charges utiles embarquees dans un MP4.
+    """Return the payloads embedded in an MP4.
 
-    Meme forme que _iter_attachments : name, mime, offset, size, ou offset et
-    size designent les octets bruts (rien n'est charge en memoire ici)."""
+    Same shape as _iter_attachments: name, mime, offset, size - where offset and
+    size point at the raw bytes (nothing is loaded into memory here)."""
     results = []
     with open(path, 'rb') as f:
         f.seek(0, os.SEEK_END)
@@ -635,14 +778,14 @@ def _mp4_attachments(path):
 
 
 def _attach_mp4(video_path, zip_bytes, name, out_path):
-    """Recopie un MP4 et ajoute la charge utile en box 'free' a la toute fin.
+    """Copy an MP4 and append the payload as a 'free' box at the very end.
 
-    Les positions de morceaux (stco/co64) sont des positions absolues dans le
-    fichier : ajouter a la fin est la seule modification qui ne peut pas les
-    invalider. Rien de ce qui existait deja ne bouge."""
-    # Une box peut declarer une taille 0, ce qui signifie "jusqu'a la fin du
-    # fichier". Ajouter apres une telle box l'engloutirait silencieusement : il
-    # faut donc d'abord ecrire sa vraie taille.
+    Chunk offsets (stco/co64) are absolute file positions: appending at the end
+    is the one edit that cannot invalidate them. Nothing already in the file
+    moves."""
+    # A box may declare a size of 0, meaning "to the end of the file". Appending
+    # after such a box would silently swallow the new data, so its real size
+    # must be written out first.
     fix = None
     with open(video_path, 'rb') as f:
         f.seek(0, os.SEEK_END)
@@ -662,8 +805,8 @@ def _attach_mp4(video_path, zip_bytes, name, out_path):
         start, real_size = fix
         if real_size > 0xFFFFFFFF:
             raise SystemExit(
-                "[ERREUR] {} se termine par une box ouverte de plus de 4 Go ;\n"
-                "         la reecrire demanderait une taille 64 bits."
+                "[ERROR] {} ends with an open-ended box larger than 4 GB;\n"
+                "        rewriting it would need a 64-bit size."
                 .format(video_path))
         with open(out_path, 'r+b') as dst:
             dst.seek(start)
@@ -671,10 +814,17 @@ def _attach_mp4(video_path, zip_bytes, name, out_path):
 
 
 # ---------------------------------------------------------------------------
-# Aiguillage entre conteneurs
+# Container dispatch
 # ---------------------------------------------------------------------------
+def _need_file(path, what="File"):
+    """Clean error (no Python traceback) if the file does not exist."""
+    if not os.path.isfile(path):
+        raise SystemExit("[ERROR] {} not found: {}".format(what, path))
+
+
 def detect_container(path):
-    """Renvoie 'mkv' ou 'mp4' en reniflant la signature du fichier."""
+    """Return 'mkv' or 'mp4' by sniffing the file signature."""
+    _need_file(path, "Video")
     with open(path, 'rb') as f:
         head = f.read(12)
     if head.startswith(EBML):
@@ -682,75 +832,171 @@ def detect_container(path):
     if len(head) >= 8 and head[4:8] in (b'ftyp', b'moov', b'mdat', b'free'):
         return 'mp4'
     raise SystemExit(
-        "[ERREUR] {} n'est ni un fichier Matroska ni un MP4.".format(path))
+        "[ERROR] {} is neither a Matroska file nor an MP4.".format(path))
 
 
 def _attachments(path):
-    """Renvoie les pieces jointes, quel que soit le conteneur."""
+    """Return the attachments, whatever the container."""
     if detect_container(path) == 'mkv':
         return _iter_attachments(path)
     return _mp4_attachments(path)
 
 
 def attach(video_path, zip_path, out_path):
-    """Accroche un fichier a une video existante, qui reste lisible."""
-    kind = detect_container(video_path)
-    with open(zip_path, 'rb') as f:
-        zip_bytes = f.read()
-    name = os.path.basename(zip_path)
+    """Attach a file to an existing video, which keeps playing.
 
+    Like pack, the payload is encrypted with the key from key/key.txt if that
+    file exists, otherwise the key is asked for; the result goes into pack/."""
+    _need_file(zip_path, "File to attach")
+    kind = detect_container(video_path)     # also checks the video exists
+    key = key_for_pack()
+    with open(zip_path, 'rb') as f:
+        clear = f.read()
+    name = os.path.basename(zip_path)
+    payload = encrypt(clear, key)
+
+    final = _output_path(PACK_DIR, out_path)
     if kind == 'mkv':
-        _attach_mkv(video_path, zip_bytes, name, out_path)
+        _attach_mkv(video_path, payload, name, final)
     else:
-        _attach_mp4(video_path, zip_bytes, name, out_path)
+        _attach_mp4(video_path, payload, name, final)
 
     before = os.path.getsize(video_path)
-    after = os.path.getsize(out_path)
-    print("[OK] {} cree : {}".format(kind.upper(), out_path))
-    print("     video porteuse : {} ({} octets, inchangee)".format(
+    after = os.path.getsize(final)
+    print("[OK] {} created: {}".format(kind.upper(), final))
+    print("     carrier video: {} ({} bytes, unchanged)".format(
         os.path.basename(video_path), before))
-    print("     zip embarque : {} ({} octets)".format(name, len(zip_bytes)))
-    print("     taille finale : {} octets  (+{})".format(after, after - before))
+    print("     embedded zip: {} ({} bytes clear)".format(name, len(clear)))
+    print("     encrypted: yes")
+    print("     final size: {} bytes  (+{})".format(after, after - before))
 
 
 def unpack(video_path, out_path=None):
-    """Extrait la (premiere) piece jointe depuis un MKV ou un MP4."""
+    """Extract the (first) attachment from an MKV or MP4.
+
+    If the payload is encrypted, it is decrypted with a key asked for at the
+    keyboard. The result is placed in the unpack/ folder (created if missing)."""
     atts = _attachments(video_path)
     if not atts:
         raise SystemExit(
-            "[ERREUR] Aucune piece jointe trouvee dans {}\n"
-            "         (si le fichier est passe par un hebergeur video, il a\n"
-            "          tres probablement ete re-encode, ce qui supprime la\n"
-            "          piece jointe)".format(video_path))
+            "[ERROR] No attachment found in {}\n"
+            "        (if the file went through a video host, it was most\n"
+            "         likely re-encoded, which drops the attachment)"
+            .format(video_path))
 
-    # On privilegie une PJ de type zip, sinon la premiere disponible.
+    # Prefer a zip attachment, otherwise the first available one.
     chosen = next((a for a in atts if a['mime'] == 'application/zip'), atts[0])
     if chosen['offset'] is None:
-        raise SystemExit("[ERREUR] La piece jointe ne contient pas de donnees.")
+        raise SystemExit("[ERROR] The attachment holds no data.")
 
     if out_path is None:
-        out_path = chosen['name'] or 'sortie.zip'
+        out_path = chosen['name'] or 'output.zip'
 
     with open(video_path, 'rb') as f:
         f.seek(chosen['offset'])
         data = f.read(chosen['size'])
-    with open(out_path, 'wb') as f:
+    if len(data) != chosen['size']:
+        raise SystemExit(
+            "[ERROR] Truncated file: expected {} bytes, read {}.".format(
+                chosen['size'], len(data)))
+
+    if is_encrypted(data):
+        data = decrypt(data, key_for_unpack())
+        state = "decrypted"
+    else:
+        # File produced before encryption was added: emit it as-is rather than
+        # fail, but say so unambiguously.
+        state = "PLAINTEXT (file predates encryption)"
+
+    final = _output_path(UNPACK_DIR, out_path)
+    with open(final, 'wb') as f:
         f.write(data)
 
-    print("[OK] zip extrait : {} ({} octets)".format(out_path, len(data)))
+    print("[OK] zip extracted: {} ({} bytes)".format(final, len(data)))
+    print("     state: {}".format(state))
 
 
 def info(video_path):
-    """Liste les pieces jointes contenues dans le MKV ou le MP4."""
+    """List the attachments contained in the MKV or MP4."""
     kind = detect_container(video_path)
     atts = _attachments(video_path)
     if not atts:
-        print("Aucune piece jointe.")
+        print("No attachment.")
         return
-    print("Pieces jointes dans {} ({}) :".format(video_path, kind.upper()))
+    print("Attachments in {} ({}):".format(video_path, kind.upper()))
     for i, a in enumerate(atts, 1):
-        print("  {}. {}  [{}]  {} octets".format(
+        print("  {}. {}  [{}]  {} bytes".format(
             i, a['name'], a['mime'], a['size']))
+
+
+# ---------------------------------------------------------------------------
+# Self-test: all in memory, touching neither the disk nor the key file
+# ---------------------------------------------------------------------------
+def selftest():
+    """Check encryption, containers and wrong-key detection.
+
+    Uses only the internal functions: does not read key/key.txt and writes
+    neither pack/ nor unpack/. Returns 0 if everything passes, 1 otherwise."""
+    ok = [0]; ko = [0]
+    def chk(name, cond):
+        if cond:
+            ok[0] += 1; print("  ok   {}".format(name))
+        else:
+            ko[0] += 1; print("  FAIL {}".format(name))
+
+    key = b'my-test-key-123'
+    for size in (0, 1, 15, 4096, 200000):
+        clear = secrets.token_bytes(size)
+        blob = encrypt(clear, key)
+        chk("encryption marked as such ({} B)".format(size), is_encrypted(blob))
+        chk("decryption identical ({} B)".format(size),
+            decrypt(blob, key) == clear)
+        # Two encryptions of the same clear must differ (random salt/nonce).
+        if size:
+            chk("random salt/nonce ({} B)".format(size),
+                encrypt(clear, key) != blob)
+
+    clear = secrets.token_bytes(50000)
+    blob = encrypt(clear, key)
+    # Wrong key: must be rejected (SystemExit), not return bogus bytes.
+    try:
+        decrypt(blob, b'wrong-key')
+        chk("wrong key rejected", False)
+    except SystemExit:
+        chk("wrong key rejected", True)
+    # Tampered file: a single flipped byte must be detected.
+    tampered = bytearray(blob); tampered[-1] ^= 0x01
+    try:
+        decrypt(bytes(tampered), key)
+        chk("tampering detected", False)
+    except SystemExit:
+        chk("tampering detected", True)
+
+    # Full round-trip in memory, for each container.
+    clear = secrets.token_bytes(120000)
+    payload = encrypt(clear, key)
+    for kind, packer in (('MKV', _pack_mkv), ('MP4', _pack_mp4)):
+        data = packer(payload, 'test.zip')
+        tmp = os.path.join(_base_dir(), '._selftest_{}'.format(kind))
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            atts = _attachments(tmp)
+            got = None
+            if atts:
+                with open(tmp, 'rb') as f:
+                    f.seek(atts[0]['offset'])
+                    got = f.read(atts[0]['size'])
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        chk("{}: attachment found".format(kind), atts and got is not None)
+        chk("{}: encrypted content intact".format(kind), got == payload)
+        chk("{}: final decryption identical".format(kind),
+            got is not None and decrypt(got, key) == clear)
+
+    print("\nselftest: {} ok, {} failure(s)".format(ok[0], ko[0]))
+    return 0 if ko[0] == 0 else 1
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +1015,7 @@ def main(argv):
 
     if cmd == 'pack':
         rest = argv[2:]
-        # --mp4 / --mkv ne servent que si le nom de sortie est laisse implicite.
+        # --mp4 / --mkv only matter when the output name is left implicit.
         default_ext = '.mkv'
         for flag, ext in (('--mp4', '.mp4'), ('--mkv', '.mkv')):
             if flag in rest:
@@ -790,7 +1036,7 @@ def main(argv):
             out_path = argv[4]
         else:
             base, ext = os.path.splitext(video_path)
-            out_path = base + '_avec_' + \
+            out_path = base + '_with_' + \
                 os.path.splitext(os.path.basename(zip_path))[0] + ext
         attach(video_path, zip_path, out_path)
 
@@ -806,8 +1052,11 @@ def main(argv):
             _usage(); return 1
         info(argv[2])
 
+    elif cmd == 'selftest':
+        return selftest()
+
     else:
-        print("Commande inconnue : {}\n".format(cmd))
+        print("Unknown command: {}\n".format(cmd))
         _usage()
         return 1
 
