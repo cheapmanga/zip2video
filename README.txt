@@ -39,13 +39,45 @@ Get it from the Microsoft Store ("Python 3") or from python.org.
 During install from python.org, tick "Add Python to PATH".
 
 
+ENCRYPTION AND THE KEY
+----------------------
+Everything you pack is encrypted. Where the key comes from depends on what you
+are doing:
+
+  pack / attach : uses key\key.txt if that file exists, otherwise it ASKS you
+                  for the key (typed hidden, like a password).
+  unpack        : never reads key\key.txt - it ALWAYS asks you for the key.
+
+So you can either keep your key in key\key.txt for convenience when packing, or
+leave that file out and type the key each time. To decrypt, you always type it.
+
+Put any key you like on the first line of key\key.txt. Keep it to yourself -
+never send it with the video, and never put it online. Whoever has the key can
+decrypt; without it the file is just noise.
+
+Outputs are tidied into folders next to the script, created automatically:
+  pack\     packing and attaching write here
+  unpack\   unpacking writes here
+
+Layout:
+  your-folder\
+      zip2mkv.py
+      key\key.txt
+      video.mkv        (optional, for 'attach')
+      pack\  unpack\   (created for you)
+
+A wrong key, or a file damaged in transit, is refused with a clear message -
+you never get silent garbage. To check the tool on a fresh copy without
+touching your key or your files:  python zip2mkv.py selftest
+
+
 HOW TO USE (easy way: drag and drop)
 ------------------------------------
   Unpack:  drag the .mkv or .mp4 onto  unpack.bat
 
-Unpacking detects the container on its own.
-
-A black window opens, shows the result, and waits for a key press.
+Unpacking detects the container on its own. A black window opens and ASKS YOU
+FOR THE DECRYPTION KEY - type it (nothing shows as you type, that is normal),
+press Enter, and the .zip appears in the unpack\ folder.
 
 There is no pack.bat: packing is done from the command line, see below.
 
@@ -59,11 +91,11 @@ HOW TO USE (command line)
 Open Command Prompt (Windows key -> type cmd -> Enter), go to this folder
 (cd C:\path\to\this\folder), then:
 
-  python zip2mkv.py pack        my_archive.zip         (-> my_archive.mkv)
-  python zip2mkv.py pack --mp4  my_archive.zip         (-> my_archive.mp4)
+  python zip2mkv.py pack        my_archive.zip         (-> pack\my_archive.mkv)
+  python zip2mkv.py pack --mp4  my_archive.zip         (-> pack\my_archive.mp4)
   python zip2mkv.py attach      video.mkv my_archive.zip   (ride along)
-  python zip2mkv.py info        my_archive.mp4         (show what is inside)
-  python zip2mkv.py unpack      my_archive.mp4         (-> my_archive.zip)
+  python zip2mkv.py info        pack\my_archive.mp4    (show what is inside)
+  python zip2mkv.py unpack      pack\my_archive.mp4    (-> unpack\my_archive.zip)
 
 You can add a last name to choose the output file. The extension you give picks
 the container:
