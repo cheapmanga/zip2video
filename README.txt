@@ -19,7 +19,6 @@ label stored alongside it says "zip".
 FILES IN THIS FOLDER
 --------------------
   zip2mkv.py   The actual program (pure Python, no dependencies).
-  pack.bat     Drag a .zip onto it -> creates the .mkv next to it.
   unpack.bat   Drag a .mkv onto it -> extracts the .zip next to it.
   README.txt   This file.
 
@@ -36,10 +35,11 @@ During install from python.org, tick "Add Python to PATH".
 
 HOW TO USE (easy way: drag and drop)
 ------------------------------------
-  Pack:    drag your .zip file onto  pack.bat
   Unpack:  drag the .mkv onto  unpack.bat
 
 A black window opens, shows the result, and waits for a key press.
+
+There is no pack.bat: packing is done from the command line, see below.
 
 If Windows shows a blue "Windows protected your PC" warning the first time,
 click "More info" -> "Run anyway". It only appears because the .bat is not

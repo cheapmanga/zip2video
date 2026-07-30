@@ -21,9 +21,9 @@ python3 zip2mkv.py info   archive.mkv                 # list what is attached
 python3 zip2mkv.py unpack archive.mkv                 # -> archive.zip
 ```
 
-On Windows there are drag-and-drop wrappers: drop a `.zip` on `pack.bat`, drop the
-resulting `.mkv` on `unpack.bat`. See `README.txt` for the end-user instructions
-shipped alongside them.
+On Windows, `unpack.bat` is a drag-and-drop wrapper: drop a `.mkv` on it and the
+file comes back out. Packing is command line only. See `README.txt` for the
+end-user instructions shipped alongside it.
 
 Despite the name, it is not limited to `.zip` — any file works. Only the MIME label
 stored next to it says "zip".
