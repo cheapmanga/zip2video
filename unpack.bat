@@ -3,8 +3,8 @@ REM ============================================================
 REM  unpack.bat  -  Extract the .zip contained in a .mkv or a .mp4
 REM
 REM  Usage: drag a .mkv or .mp4 file onto this .bat icon.
-
-REM  The .zip is recreated next to the video.
+REM  The window will ASK YOU FOR THE DECRYPTION KEY (typed hidden).
+REM  The .zip is recreated in the unpack\ folder.
 REM  (Must stay in the same folder as zip2mkv.py)
 REM ============================================================
 setlocal
@@ -39,6 +39,9 @@ if "%MKV%"=="" (
     exit /b 1
 )
 
+echo.
+echo When asked, type your decryption key and press Enter.
+echo (Nothing shows as you type - that is normal.)
 echo.
 python "%~dp0zip2mkv.py" unpack "%MKV%"
 echo.
